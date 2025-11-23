@@ -10,12 +10,12 @@ import time # We will use this to ensure a steady processing rate
 
 
 # Load the camera calibration values
-camera_calibration = np.load('Sample_Calibration.npz')
+camera_calibration = np.load('Calibration.npz')
 CM=camera_calibration['CM'] #camera matrix
 dist_coef=camera_calibration['dist_coef']# distortion coefficients from the camera
 
 # Define the ArUco dictionary and parameters
-marker_size = 40
+marker_size = 0.03  # Size of the marker in meters
 aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
 parameters = aruco.DetectorParameters()
 
@@ -43,14 +43,21 @@ while True:
         print("Can't receive frame (stream end?). Exiting ...")
         break
 
+    # --- Insert crop here: keep narrow central vertical strip ---
+    h, w = frame.shape[:2]
+    narrow_ratio = 0.2   # keep 20% of width (adjust as needed)
+    new_w = int(w * narrow_ratio)
+    x1 = (w - new_w) // 2
+    x2 = x1 + new_w
+    frame = frame[:, x1:x2]  # replace frame with the cropped view
+    # --- end insert ---
+
     # Convert frame to grayscale
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     cv2.imshow('gray-image', gray)
 
     # Detect markers
     corners, ids, rejectedImgPoints = aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
-
-    
 
     # If markers are detected
     if ids is not None:
@@ -62,8 +69,16 @@ while True:
 
         for rvec, tvec in zip(rvecs, tvecs):
             # Draw axis for each marker
-            frame = cv2.drawFrameAxes(frame, CM, dist_coef, rvec, tvec, 100)
-
+            t = tvec[0]
+            distance = np.linalg.norm(t)
+            forward_z = t[2]
+            frame = cv2.drawFrameAxes(frame, CM, dist_coef, rvec, tvec, 0.05)
+             # Put distance text near marker (you can adjust position)
+            c = corners[0][0].astype(int) if len(corners) else None
+            text_pos = (10, 90)
+            cv2.putText(frame, f"Dist: {distance:.2f} m (z={forward_z:.2f} m)", text_pos,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
     # Add the frame rate to the image
     cv2.putText(frame, f"CAMERA FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
     cv2.putText(frame, f"PROCESSING FPS: {1/processing_period:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
@@ -81,8 +96,6 @@ while True:
     if elapsed_time < processing_period:
         time.sleep(processing_period - elapsed_time)
     start_time = time.time()
-
-
 
 # When everything is done, release the capture and close windows
 cap.release()
