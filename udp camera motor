@@ -1,0 +1,94 @@
+import cv2
+import socket
+import struct
+import time
+
+# --- UDP setup ---
+UDP_IP   = "138.38.229.25"   # machine running Simulink / RPi IP
+UDP_PORT = 6767              # must match Simulink local port
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+# --- ArUco setup ---
+aruco = cv2.aruco
+dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+parameters = aruco.DetectorParameters()   # works with your OpenCV
+
+cap = cv2.VideoCapture(1)
+
+TARGET_ID       = 1      # ID we care about
+PULSE_DURATION  = 3.0    # seconds sending '1'
+COOLDOWN_TIME   = 3.0    # seconds where it can't retrigger
+
+# --- State variables ---
+trigger_active  = False  # currently in 3s ON window?
+cooldown_active = False  # currently in cooldown window?
+trigger_start   = 0.0
+cooldown_start  = 0.0
+last_id_found   = False  # for detecting rising edge
+
+while True:
+    ret, frame = cap.read()
+    
+    if not ret:
+        break
+
+    # --- Insert crop here: keep narrow central vertical strip ---
+    h, w = frame.shape[:2]
+    narrow_ratio = 0.1   # keep 10% of width (adjust as needed)
+    new_w = int(w * narrow_ratio)
+    x1 = (w - new_w) // 2
+    x2 = x1 + new_w
+    frame = frame[:, x1:x2]  # replace frame with the cropped view
+    # --- end insert ---
+    
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    corners, ids, rejected = aruco.detectMarkers(gray, dictionary, parameters=parameters)
+    
+    # Is TARGET_ID currently seen?
+    id_found = False
+    if ids is not None and TARGET_ID in ids.flatten():
+        id_found = True
+
+    now = time.time()
+
+    # ----- 1. Handle triggering -----
+    # We only trigger on a rising edge AND if we're not in cooldown or already active
+    if id_found and not last_id_found and not trigger_active and not cooldown_active:
+        trigger_active = True
+        trigger_start = now
+        print("🔵 Trigger started (ID seen)")
+
+    # ----- 2. Update trigger and cooldown state -----
+    if trigger_active:
+        # Check if 3s pulse is over
+        if now - trigger_start > PULSE_DURATION:
+            trigger_active = False
+            cooldown_active = True
+            cooldown_start = now
+            print("🔴 Trigger ended, cooldown started")
+
+    elif cooldown_active:
+        # Check if cooldown finished
+        if now - cooldown_start > COOLDOWN_TIME:
+            cooldown_active = False
+            print("✅ Cooldown finished, ready to trigger again")
+
+    # ----- 3. Decide what to send -----
+    # 1 during pulse, 0 otherwise (including cooldown)
+    laser_flag = 1 if trigger_active else 0
+
+    msg = struct.pack('B', laser_flag)
+    sock.sendto(msg, (UDP_IP, UDP_PORT))
+
+    # Debug display
+    aruco.drawDetectedMarkers(frame, corners, ids)
+    cv2.imshow("ArUco", frame)
+
+    last_id_found = id_found
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+sock.close()
