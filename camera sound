@@ -1,0 +1,48 @@
+import cv2
+import time
+import winsound   # Windows built-in; for Linux/Mac see note below
+
+# 1. Set up camera
+cap = cv2.VideoCapture(1)
+
+# 2. Set up ArUco dictionary + parameters
+aruco_dict  = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+aruco_params = cv2.aruco.DetectorParameters()
+
+# 3. Which marker IDs should trigger a sound?
+TARGET_IDS = {0, 1, 2}  # put the IDs you want here
+
+# 4. Cooldown so it doesn’t beep constantly
+last_beep_time = 0
+BEEP_COOLDOWN = 1.0   # seconds
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # 5. Detect markers
+    corners, ids, rejected = cv2.aruco.detectMarkers(frame, aruco_dict, parameters=aruco_params)
+
+    if ids is not None:
+        # Flatten ids array, e.g. [[3],[5]] -> [3,5]
+        detected_ids = set(int(i) for i in ids.flatten())
+
+        # 6. Check if any of the detected IDs are in our target set
+        if detected_ids & TARGET_IDS:
+            now = time.time()
+            if now - last_beep_time > BEEP_COOLDOWN:
+                # Play a short beep (frequency, duration_ms)
+                winsound.Beep(1000, 200)
+                last_beep_time = now
+
+        # Draw markers for debugging
+        cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+
+    cv2.imshow("ArUco detection", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
