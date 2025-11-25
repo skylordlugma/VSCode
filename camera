@@ -7,7 +7,7 @@ while True:
     h, w = frame.shape[:2]
 
     # -------- Narrow width crop --------
-    narrow_ratio = 0.2   # keep 30% of width (adjust this!)
+    narrow_ratio = 0.1   # keep 30% of width (adjust this!)
 
     new_w = int(w * narrow_ratio)
     x1 = (w - new_w) // 2

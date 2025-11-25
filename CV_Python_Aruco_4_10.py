@@ -45,7 +45,7 @@ while True:
 
     # --- Insert crop here: keep narrow central vertical strip ---
     h, w = frame.shape[:2]
-    narrow_ratio = 0.2   # keep 20% of width (adjust as needed)
+    narrow_ratio = 0.1   # keep 10% of width (adjust as needed)
     new_w = int(w * narrow_ratio)
     x1 = (w - new_w) // 2
     x2 = x1 + new_w
