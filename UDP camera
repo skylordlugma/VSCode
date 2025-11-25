@@ -3,8 +3,8 @@ import socket
 import struct
 
 # --- UDP setup ---
-UDP_IP   = "138.38.229.25"    # machine running Simulink / RPi IP
-UDP_PORT = 6767             # must match Simulink local port
+UDP_IP   = "138.38.229.25"   # Simulink/MATLAB machine IP
+UDP_PORT = 6767              # must match Simulink local port
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -22,15 +22,15 @@ while True:
     if not ret:
         break
 
-    corners, ids, rejected = aruco.detectMarkers(frame, dictionary, parameters=parameters)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    corners, ids, rejected = aruco.detectMarkers(gray, dictionary, parameters=parameters)
 
-    laser_flag = 0
+    laser_flag = 0  # default: OFF
 
     if ids is not None:
         if TARGET_ID in ids.flatten():
-            laser_flag = 1  # “ID seen, turn laser ON”
+            laser_flag = 1  # ID seen → ON
 
-    # pack as a single byte (uint8)
     msg = struct.pack('B', laser_flag)
     sock.sendto(msg, (UDP_IP, UDP_PORT))
 
@@ -43,4 +43,3 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
-

@@ -1,0 +1,69 @@
+import cv2
+import socket
+import struct
+
+# --- ArUco setup ---
+aruco = cv2.aruco
+dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+parameters = aruco.DetectorParameters()
+
+cap = cv2.VideoCapture(1)
+
+UDP_IP   = "138.38.229.25"
+UDP_PORT = 6767
+TARGET_ID = 1
+
+udp_active = False     # Whether the UDP link is currently ON
+sock = None            # Will create only when needed
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    corners, ids, rejected = aruco.detectMarkers(gray, dictionary, parameters=parameters)
+
+    id_found = False
+    if ids is not None and TARGET_ID in ids.flatten():
+        id_found = True
+
+    # -------------------------
+    # CASE 1: ID is found → START or CONTINUE UDP
+    # -------------------------
+    if id_found:
+        if not udp_active:
+            print("🔵 Opening UDP link...")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_active = True
+
+        # Send 1 (ID seen)
+        msg = struct.pack('B', 1)
+        sock.sendto(msg, (UDP_IP, UDP_PORT))
+
+    # -------------------------
+    # CASE 2: ID is NOT found → STOP UDP
+    # -------------------------
+    else:
+        if udp_active:
+            print("🔴 Closing UDP link (ID lost).")
+            # Optional: send a final 0 before closing
+            msg = struct.pack('B', 0)
+            sock.sendto(msg, (UDP_IP, UDP_PORT))
+
+            sock.close()
+            sock = None
+            udp_active = False
+
+    # --- Debug window ----
+    aruco.drawDetectedMarkers(frame, corners, ids)
+    cv2.imshow("ArUco", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+# Clean exit
+if sock is not None:
+    sock.close()
+cap.release()
+cv2.destroyAllWindows()
