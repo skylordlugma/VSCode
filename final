@@ -98,16 +98,11 @@ def choose_active_ids():
     print("==========================================\n")
     return active_ids
 
-
 # =====================================================================
-#                         CAMERA & ARUCO SETUP
+#                         CAMERA ACTIVATES HERE
 # =====================================================================
 
-# Turn camera on IMMEDIATELY
 cap = cv2.VideoCapture(1)
-if not cap.isOpened():
-    print("❌ Could not open camera 1. Check device index / connection.")
-    raise SystemExit
 
 # ArUco setup
 aruco = cv2.aruco
@@ -127,12 +122,15 @@ AUDIO_COOLDOWN = 2.0  # seconds between sound plays
 last_played = {id_: 0 for id_ in SOUND_MAP.keys()}
 
 # Laser pulse settings
-PULSE_DURATION = 1.0        # laser ON time (seconds)
-LASER_COOLDOWN = 1.0        # cooldown time after laser pulse (seconds)
+PULSE_DURATION = 1.0        # laser ON time
+LASER_COOLDOWN = 1.0        # cooldown time after laser pulse
 
 # UDP for sending laser flag TO Simulink
 UDP_IP   = "138.38.229.25"
 UDP_PORT = 6767             # must match Simulink receive port
+
+# NEW: UDP port for "all targets done" infinite signal
+UDP_DONE_PORT = 42069  
 
 # UDP port for receiving homing confirmation FROM Simulink
 HOME_PORT = 6969
@@ -145,73 +143,33 @@ HOME_PORT = 6969
 # --- UDP: Send to Simulink ---
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+
 # --- UDP: Receive homing signal ---
 home_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 home_sock.bind(("0.0.0.0", HOME_PORT))
-# Non-blocking so we can keep showing camera
-home_sock.setblocking(False)
+home_sock.setblocking(True)
 
 print("⏳ Waiting for homing signal from Simulink... (expecting raw byte 1)")
-print("📷 Camera is ON — live preview while waiting for homing.")
 
 # =====================================================================
-#         LIVE CAMERA PREVIEW WHILE WAITING FOR HOMING
+#                 WAIT HERE UNTIL HOMING IS COMPLETE
 # =====================================================================
 
 homed = False
-
 while not homed:
-    # Read and display camera frame
-    ret, frame = cap.read()
-    if not ret:
-        print("⚠️ Failed to grab frame from camera.")
-        break
+    data, _ = home_sock.recvfrom(1024)
 
-    # Just show full frame while waiting (no cropping needed yet)
-    cv2.imshow("ArUco", frame)
-    ret, frame = cap.read()
-    if not ret:
-        print("⚠️ Failed to grab frame from camera.")
-        break
+    if data == b'\x01':  # Received from Simulink (GPIO hit end switch)
+        print("🏁 Homing complete — sending startup laser pulse...")
 
-    # ---- Apply SAME crop as scanning loop ----
-    h, w = frame.shape[:2]
-    narrow_ratio = 0.1        # keep 10% of width
-new_w = int(w * narrow_ratio)
-x1 = (w - new_w) // 2
-x2 = x1 + new_w
-frame = frame[:, x1:x2]
+        print("🔊 Playing HOME.wav and waiting 3 seconds...")
+        HOME_SOUND.play()
 
-cv2.imshow("ArUco", frame)
+        homed = True
+        print("🏁 Starting camera and scanning...")
 
-    # Check for homing signal (non-blocking)
-    try:
-        data, _ = home_sock.recvfrom(1024)
-        if data == b'\x01':  # homing complete from Simulink
-            print("🏁 Homing complete — playing HOME.wav and sending startup laser pulse...")
-            HOME_SOUND.play()
-            time.sleep(3.0)
-
-            # Optional: Send a startup laser pulse
-            sock.sendto(struct.pack('B', 1), (UDP_IP, UDP_PORT))
-            time.sleep(PULSE_DURATION)
-            sock.sendto(struct.pack('B', 0), (UDP_IP, UDP_PORT))
-
-            homed = True
-            print("🏁 Homing sequence finished — starting scanning loop...")
-    except BlockingIOError:
-        # No homing packet yet, just continue displaying camera
-        pass
-
-    # Allow user to quit during homing wait
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        print("👋 Program aborted during homing wait.")
-        cap.release()
-        cv2.destroyAllWindows()
-        sock.close()
-        home_sock.close()
-        pygame.mixer.quit()
-        raise SystemExit
+        # --- SEND THE SAME LASER PULSE AS NORMAL TRIGGER ---
+        laser_flag = 1
 
 
 # =====================================================================
@@ -224,10 +182,14 @@ trigger_start   = 0.0
 cooldown_start  = 0.0
 last_active_id_found = False  # tracks rising edge detection
 
+# NEW: track which active IDs have been seen
+scanned_ids = set()
+all_done = False
+
+
 while True:
     ret, frame = cap.read()
     if not ret:
-        print("⚠️ Failed to grab frame from camera.")
         break
 
     # ---- Crop central narrow vertical strip ----
@@ -248,6 +210,18 @@ while True:
 
     # Check if *any* active ID is present
     active_id_found = any(mid in ACTIVE_IDS for mid in detected_ids)
+
+    # ✅ Update which ACTIVE_IDS have been seen at least once
+    for mid in detected_ids:
+        if mid in ACTIVE_IDS:
+            if mid not in scanned_ids:
+                print(f"👀 First time seeing active ID {mid} ({VEG_NAMES[mid]})")
+            scanned_ids.add(mid)
+
+    # ✅ Check if we have now seen ALL active targets
+    if not all_done and scanned_ids.issuperset(ACTIVE_IDS):
+        all_done = True
+        print("🎉 All selected targets have been scanned! Starting infinite UDP signal to port 42069.")
 
     now = time.time()
 
@@ -280,6 +254,14 @@ while True:
     sock.sendto(struct.pack('B', laser_flag), (UDP_IP, UDP_PORT))
 
     # =================================================================
+    #                  "ALL DONE" INFINITE UDP SIGNAL
+    # =================================================================
+
+    if all_done:
+        # Send continuous '1' bytes to UDP_DONE_PORT every loop iteration
+        sock.sendto(struct.pack('B', 1), (UDP_IP, UDP_DONE_PORT))
+
+    # =================================================================
     #                          AUDIO LOGIC
     # =================================================================
 
@@ -301,7 +283,6 @@ while True:
     last_active_id_found = active_id_found
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
-        print("👋 Program closed by user.")
         break
 
 # =====================================================================
