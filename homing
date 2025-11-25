@@ -30,17 +30,39 @@ ACTIVE_IDS = [3, 5, 6]   # <---- EDIT THIS LIST
 AUDIO_COOLDOWN = 3.0  # seconds between sound plays
 last_played = {id_: 0 for id_ in SOUND_MAP.keys()}
 
-# === UDP SETUP ===
-UDP_IP   = "138.38.229.25"   # Simulink / RPi IP
+# === UDP SETUP (LASER FLAG TO SIMULINK) ===
+UDP_IP   = "138.38.229.25"
 UDP_PORT = 6767
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+# === UDP SETUP (RECEIVE HOMING BYTE FROM SIMULINK) ===
+HOME_PORT = 6789
+home_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+home_sock.bind(("0.0.0.0", HOME_PORT))
+home_sock.setblocking(True)
+
+print("⏳ Waiting for homing signal (expecting raw byte = 1)...")
+
+# ---------------------------------------------------------------------
+#                          HOMING WAIT LOOP
+# ---------------------------------------------------------------------
+homed = False
+while not homed:
+    data, _ = home_sock.recvfrom(1024)
+    if data == b'\x01':   # Simulink sends uint8(1) once when GPIO hits end switch
+        homed = True
+        print("🏁 Homing complete — starting camera & scanning...")
+
+# ---------------------------------------------------------------------
+#                          CAMERA ACTIVATES NOW
+# ---------------------------------------------------------------------
+
+cap = cv2.VideoCapture(1)
 
 # === ARUCO SETUP ===
 aruco = cv2.aruco
 dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
 parameters = aruco.DetectorParameters()
-
-cap = cv2.VideoCapture(1)
 
 # === LASER TRIGGER SETTINGS ===
 PULSE_DURATION = 2.0   # seconds ON
@@ -50,8 +72,11 @@ trigger_active  = False
 cooldown_active = False
 trigger_start   = 0.0
 cooldown_start  = 0.0
-last_id_found   = False   # "any active ID" seen last frame?
+last_id_found   = False
 
+# ---------------------------------------------------------------------
+#                            MAIN LOOP
+# ---------------------------------------------------------------------
 while True:
     ret, frame = cap.read()
     if not ret:
@@ -59,7 +84,7 @@ while True:
 
     # --- CROP TO NARROW VERTICAL STRIP ---
     h, w = frame.shape[:2]
-    narrow_ratio = 0.1   # keep central 10% of width
+    narrow_ratio = 0.1
     new_w = int(w * narrow_ratio)
     x1 = (w - new_w) // 2
     x2 = x1 + new_w
@@ -73,20 +98,19 @@ while True:
     if ids is not None:
         detected_ids = {int(i) for i in ids.flatten()}
 
-    # Is ANY active ID present?
+    # Check if ANY active ID is present
     active_id_found = any(mid in ACTIVE_IDS for mid in detected_ids)
 
     now = time.time()
 
-    # === LASER TRIGGER STATE MACHINE ===
-
-    # Rising edge of any active ID, and allowed to trigger
+    # -----------------------------------------------------------------
+    #                     LASER STATE MACHINE
+    # -----------------------------------------------------------------
     if active_id_found and not last_id_found and not trigger_active and not cooldown_active:
         trigger_active = True
         trigger_start = now
-        print("🔵 Laser trigger STARTED (active ID seen)")
+        print("🔵 Laser trigger STARTED")
 
-    # Maintain or end the 3s pulse
     if trigger_active:
         if now - trigger_start > PULSE_DURATION:
             trigger_active = False
@@ -94,25 +118,28 @@ while True:
             cooldown_start = now
             print("🔴 Laser trigger ENDED → cooldown started")
 
-    # End cooldown
     if cooldown_active:
         if now - cooldown_start > COOLDOWN_TIME:
             cooldown_active = False
-            print("✅ Cooldown finished → ready to trigger again")
+            print("✅ Laser cooldown finished — ready again")
 
-    # UDP flag: 1 during pulse, 0 otherwise
+    # Send 1 during pulse, 0 otherwise
     laser_flag = 1 if trigger_active else 0
     sock.sendto(struct.pack('B', laser_flag), (UDP_IP, UDP_PORT))
 
-    # === AUDIO: ONLY FOR ACTIVE IDS ===
+    # -----------------------------------------------------------------
+    #                          AUDIO LOGIC
+    # -----------------------------------------------------------------
     for mid in detected_ids:
         if mid in SOUND_MAP and mid in ACTIVE_IDS:
             if now - last_played[mid] >= AUDIO_COOLDOWN:
                 SOUND_MAP[mid].play()
                 last_played[mid] = now
-                print(f"🔊 Played sound for active ID {mid}")
+                print(f"🔊 Played sound for ID {mid}")
 
-    # === DISPLAY ===
+    # -----------------------------------------------------------------
+    #                          DISPLAY
+    # -----------------------------------------------------------------
     if ids is not None:
         aruco.drawDetectedMarkers(frame, corners, ids)
 
@@ -122,8 +149,13 @@ while True:
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# Clean exit
+# ---------------------------------------------------------------------
+#                            CLEAN EXIT
+# ---------------------------------------------------------------------
 cap.release()
 cv2.destroyAllWindows()
 sock.close()
+home_sock.close()
 pygame.mixer.quit()
+
+print("👋 Program closed cleanly.")

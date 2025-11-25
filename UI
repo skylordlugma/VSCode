@@ -1,0 +1,260 @@
+import cv2
+import socket
+import struct
+import time
+import pygame
+
+# =====================================================================
+#                         AUDIO & VEGETABLE MAP
+# =====================================================================
+
+pygame.mixer.init()
+
+SOUND_MAP = {
+    1: pygame.mixer.Sound("eggplant.wav"),
+    2: pygame.mixer.Sound("redpepper.wav"),
+    3: pygame.mixer.Sound("pumpkin.wav"),
+    4: pygame.mixer.Sound("onion.wav"),
+    5: pygame.mixer.Sound("broccoli.wav"),
+    6: pygame.mixer.Sound("garlic.wav"),
+    7: pygame.mixer.Sound("tomato.wav"),
+    8: pygame.mixer.Sound("carrot.wav"),
+}
+
+VEG_NAMES = {
+    1: "eggplant",
+    2: "redpepper",
+    3: "pumpkin",
+    4: "onion",
+    5: "broccoli",
+    6: "garlic",
+    7: "tomato",
+    8: "carrot",
+}
+
+# reverse lookup: name -> id
+NAME_TO_ID = {name.lower(): vid for vid, name in VEG_NAMES.items()}
+
+
+def choose_active_ids():
+    """
+    Simple terminal UI:
+    - Shows list of IDs + vegetable names
+    - Lets you type IDs and/or names, separated by commas
+    - Returns a list of IDs to use as ACTIVE_IDS
+    """
+    print("==========================================")
+    print("   Select ACTIVE VEGETABLE IDS")
+    print("   (these will trigger laser + sounds)")
+    print("==========================================")
+    print("Available IDs:")
+    for vid in sorted(SOUND_MAP.keys()):
+        print(f"  {vid}: {VEG_NAMES[vid]}")
+    print("------------------------------------------")
+    print("You can enter:")
+    print("  • IDs:        e.g. 3,5,6")
+    print("  • Names:      e.g. pumpkin, garlic")
+    print("  • Or mixed:   e.g. 3, garlic, tomato")
+    print("------------------------------------------")
+
+    active_ids = []
+
+    while not active_ids:
+        raw = input("Enter your selection: ").strip()
+        if not raw:
+            print("No input detected, please try again.")
+            continue
+
+        chosen = []
+        for token in raw.split(","):
+            token = token.strip().lower()
+            if not token:
+                continue
+
+            # If it's a number, treat as ID
+            if token.isdigit():
+                vid = int(token)
+                if vid in SOUND_MAP:
+                    chosen.append(vid)
+                else:
+                    print(f"  ! ID {vid} is not in SOUND_MAP, ignoring.")
+            else:
+                # Try by vegetable name
+                if token in NAME_TO_ID:
+                    chosen.append(NAME_TO_ID[token])
+                else:
+                    print(f"  ! Name '{token}' not recognised, ignoring.")
+
+        # remove duplicates
+        active_ids = sorted(set(chosen))
+
+        if not active_ids:
+            print("No valid IDs selected. Please try again.\n")
+
+    print("\n✅ Active IDs set to:", active_ids)
+    print("   (", ", ".join(f"{vid}:{VEG_NAMES[vid]}" for vid in active_ids), ")")
+    print("==========================================\n")
+    return active_ids
+
+
+# =====================================================================
+#                         USER CONFIGURATION
+# =====================================================================
+
+# Ask user which IDs should be active
+ACTIVE_IDS = choose_active_ids()
+
+# Audio cooldown per ID
+AUDIO_COOLDOWN = 3.0  # seconds between sound plays
+last_played = {id_: 0 for id_ in SOUND_MAP.keys()}
+
+# Laser pulse settings
+PULSE_DURATION = 2.0        # laser ON time
+LASER_COOLDOWN = 3.0        # cooldown time after laser pulse
+
+# UDP for sending laser flag TO Simulink
+UDP_IP   = "138.38.229.25"
+UDP_PORT = 6767             # must match Simulink receive port
+
+# UDP port for receiving homing confirmation FROM Simulink
+HOME_PORT = 6969
+
+
+# =====================================================================
+#                          INITIAL SETUP
+# =====================================================================
+
+# --- UDP: Send to Simulink ---
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+# --- UDP: Receive homing signal ---
+home_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+home_sock.bind(("0.0.0.0", HOME_PORT))
+home_sock.setblocking(True)
+
+print("⏳ Waiting for homing signal from Simulink... (expecting raw byte 1)")
+
+
+# =====================================================================
+#                 WAIT HERE UNTIL HOMING IS COMPLETE
+# =====================================================================
+
+homed = False
+while not homed:
+    data, _ = home_sock.recvfrom(1024)
+    if data == b'\x01':   # expecting a single byte: 1
+        homed = True
+        print("🏁 Homing complete — activating camera and scanning...")
+
+
+# =====================================================================
+#                         CAMERA ACTIVATES HERE
+# =====================================================================
+
+cap = cv2.VideoCapture(1)
+
+# ArUco setup
+aruco = cv2.aruco
+dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+parameters = aruco.DetectorParameters()
+
+
+# =====================================================================
+#                     SCANNING + LASER + AUDIO LOOP
+# =====================================================================
+
+trigger_active  = False
+cooldown_active = False
+trigger_start   = 0.0
+cooldown_start  = 0.0
+last_active_id_found = False  # tracks rising edge detection
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # ---- Crop central narrow vertical strip ----
+    h, w = frame.shape[:2]
+    narrow_ratio = 0.1        # keep 10% of width
+    new_w = int(w * narrow_ratio)
+    x1 = (w - new_w) // 2
+    x2 = x1 + new_w
+    frame = frame[:, x1:x2]
+
+    # ---- Detect markers ----
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    corners, ids, rejected = aruco.detectMarkers(gray, dictionary, parameters=parameters)
+
+    detected_ids = set()
+    if ids is not None:
+        detected_ids = {int(i) for i in ids.flatten()}
+
+    # Check if *any* active ID is present
+    active_id_found = any(mid in ACTIVE_IDS for mid in detected_ids)
+
+    now = time.time()
+
+    # =================================================================
+    #                         LASER STATE MACHINE
+    # =================================================================
+
+    # Rising edge: ID appears and we are not in cooldown or already triggered
+    if active_id_found and not last_active_id_found and not trigger_active and not cooldown_active:
+        trigger_active = True
+        trigger_start = now
+        print("🔵 Laser trigger STARTED (active ID detected)")
+
+    # Maintain trigger during pulse
+    if trigger_active:
+        if now - trigger_start > PULSE_DURATION:
+            trigger_active = False
+            cooldown_active = True
+            cooldown_start = now
+            print("🔴 Laser trigger ENDED — cooldown started")
+
+    # Cooldown logic
+    if cooldown_active:
+        if now - cooldown_start > LASER_COOLDOWN:
+            cooldown_active = False
+            print("✅ Cooldown finished — ready to trigger again")
+
+    # Send laser flag to Simulink
+    laser_flag = 1 if trigger_active else 0
+    sock.sendto(struct.pack('B', laser_flag), (UDP_IP, UDP_PORT))
+
+    # =================================================================
+    #                          AUDIO LOGIC
+    # =================================================================
+
+    for mid in detected_ids:
+        if mid in SOUND_MAP and mid in ACTIVE_IDS:
+            if now - last_played[mid] >= AUDIO_COOLDOWN:
+                SOUND_MAP[mid].play()
+                last_played[mid] = now
+                print(f"🔊 Played sound for active ID {mid} ({VEG_NAMES[mid]})")
+
+    # =================================================================
+    #                          DISPLAY
+    # =================================================================
+
+    if ids is not None:
+        aruco.drawDetectedMarkers(frame, corners, ids)
+
+    cv2.imshow("ArUco", frame)
+    last_active_id_found = active_id_found
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+# =====================================================================
+#                         CLEAN EXIT
+# =====================================================================
+
+cap.release()
+cv2.destroyAllWindows()
+sock.close()
+home_sock.close()
+pygame.mixer.quit()
+
+print("👋 Program closed cleanly.")
