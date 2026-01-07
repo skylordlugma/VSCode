@@ -1,0 +1,267 @@
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+import time
+from collections import deque
+
+# ----------------------------
+# CONFIG
+# ----------------------------
+ROBOT1_ID = 1                 # Target robot marker ID
+ROBOT2_ID = 2                 # Chaser robot marker ID
+
+MAX_HISTORY = 30              # points used for velocity estimation
+ALPHA_POS = 0.35              # EMA smoothing for position
+MIN_STEP_PX = 2               # ignore jitter smaller than this
+
+PREDICT_HORIZON_S = 2.5       # draw target prediction this far
+PREDICT_DT_S = 0.1            # step for prediction polyline
+
+# Chaser capability in PIXELS / SECOND (tune this)
+CHASER_SPEED_PX_S = 250.0     # <-- tune to match robot 2 max speed as seen in image
+
+# Safety/tuning
+MAX_INTERCEPT_T = 3.0         # cap intercept time (seconds) for drawing/robustness
+
+
+
+# ----------------------------
+# ArUco setup
+# ----------------------------
+aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+parameters = aruco.DetectorParameters()
+
+cap = cv2.VideoCapture(1)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+
+cv2.namedWindow("frame", cv2.WINDOW_AUTOSIZE)
+
+# ----------------------------
+# State buffers
+# ----------------------------
+# history entries: (t, np.array([x,y]))
+hist1 = deque(maxlen=MAX_HISTORY)
+hist2 = deque(maxlen=MAX_HISTORY)
+
+trail1 = deque(maxlen=400)  # past trail for robot1
+
+pos1_filt = None
+pos2_filt = None
+
+last_trail1_pt = None
+
+def centroid_from_corners(corners_4x2: np.ndarray) -> np.ndarray:
+    return np.mean(corners_4x2, axis=0)
+
+def maybe_append_trail(trail, pt_int, last_pt_holder_name):
+    # helper for jitter rejection
+    global last_trail1_pt
+    last_pt = last_trail1_pt if last_pt_holder_name == "trail1" else None
+
+    if last_pt is None:
+        trail.append(pt_int)
+        if last_pt_holder_name == "trail1":
+            last_trail1_pt = pt_int
+        return
+
+    dx = pt_int[0] - last_pt[0]
+    dy = pt_int[1] - last_pt[1]
+    if dx*dx + dy*dy >= MIN_STEP_PX*MIN_STEP_PX:
+        trail.append(pt_int)
+        if last_pt_holder_name == "trail1":
+            last_trail1_pt = pt_int
+
+def estimate_velocity(history_deque):
+    """
+    Least-squares fit x(t), y(t) -> velocity (vx,vy) in px/s.
+    """
+    if len(history_deque) < 6:
+        return None
+
+    t = np.array([h[0] for h in history_deque], dtype=np.float64)
+    p = np.array([h[1] for h in history_deque], dtype=np.float64)  # (N,2)
+
+    t0 = t[0]
+    tt = t - t0
+    A = np.vstack([tt, np.ones_like(tt)]).T  # (N,2)
+
+    vx, _bx = np.linalg.lstsq(A, p[:, 0], rcond=None)[0]
+    vy, _by = np.linalg.lstsq(A, p[:, 1], rcond=None)[0]
+    return np.array([float(vx), float(vy)], dtype=np.float64)
+
+def solve_intercept_time(pT, vT, pC, sC, t_cap=MAX_INTERCEPT_T):
+    """
+    Solve || (pT - pC) + vT*t || = sC*t for t >= 0.
+    Returns best positive t, or None if no feasible solution.
+    """
+    r = (pT - pC).astype(np.float64)
+
+    a = float(np.dot(vT, vT) - sC*sC)
+    b = float(2.0 * np.dot(r, vT))
+    c = float(np.dot(r, r))
+
+    # Handle near-linear case
+    eps = 1e-9
+    if abs(a) < eps:
+        # Then equation is b*t + c = 0 (approximately)
+        if abs(b) < eps:
+            return None
+        t = -c / b
+        if t > 0:
+            return float(min(t, t_cap))
+        return None
+
+    disc = b*b - 4*a*c
+    if disc < 0:
+        return None
+
+    sqrt_disc = float(np.sqrt(disc))
+    t1 = (-b - sqrt_disc) / (2*a)
+    t2 = (-b + sqrt_disc) / (2*a)
+
+    # Choose smallest positive time
+    candidates = [t for t in (t1, t2) if t > 0]
+    if not candidates:
+        return None
+
+    t_best = min(candidates)
+    if t_best > t_cap:
+        t_best = t_cap
+    return float(t_best)
+
+def draw_x(img, pt, size=12, color=(255, 0, 255), thickness=3):
+    x, y = pt
+    cv2.line(img, (x - size, y - size), (x + size, y + size), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x - size, y + size), (x + size, y - size), color, thickness, cv2.LINE_AA)
+
+while True:
+    loop_start = time.perf_counter()
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        print("Failed to grab frame.")
+        break
+
+    now = time.perf_counter()
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    corners, ids, rejected = aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
+
+    out = frame.copy()
+
+    seen1 = False
+    seen2 = False
+    p1 = None
+    p2 = None
+
+    if ids is not None and len(ids) > 0:
+        ids_flat = ids.flatten()
+        aruco.drawDetectedMarkers(out, corners, ids)
+
+        for i, mid in enumerate(ids_flat):
+            c = corners[i][0]
+            pt = centroid_from_corners(c)
+
+            if int(mid) == ROBOT1_ID:
+                seen1 = True
+                if pos1_filt is None:
+                    pos1_filt = pt.copy()
+                else:
+                    pos1_filt = (1.0 - ALPHA_POS) * pos1_filt + ALPHA_POS * pt
+                p1 = pos1_filt
+                hist1.append((now, p1.copy()))
+
+                p1_int = (int(p1[0]), int(p1[1]))
+                maybe_append_trail(trail1, p1_int, "trail1")
+                cv2.circle(out, p1_int, 6, (0, 255, 0), -1)
+                cv2.putText(out, f"R1 ID:{ROBOT1_ID}", (p1_int[0] + 10, p1_int[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+
+            elif int(mid) == ROBOT2_ID:
+                seen2 = True
+                if pos2_filt is None:
+                    pos2_filt = pt.copy()
+                else:
+                    pos2_filt = (1.0 - ALPHA_POS) * pos2_filt + ALPHA_POS * pt
+                p2 = pos2_filt
+                hist2.append((now, p2.copy()))
+
+                p2_int = (int(p2[0]), int(p2[1]))
+                cv2.circle(out, p2_int, 6, (255, 255, 0), -1)
+                cv2.putText(out, f"R2 ID:{ROBOT2_ID}", (p2_int[0] + 10, p2_int[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2, cv2.LINE_AA)
+
+    # Draw Robot 1 past trail
+    if len(trail1) >= 2:
+        pts = np.array(trail1, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(out, [pts], False, (0, 255, 255), 2)
+
+    # Estimate target velocity, draw prediction, and intercept point
+    v1 = estimate_velocity(hist1)
+    if seen1 and p1 is not None and v1 is not None:
+        # Draw target prediction polyline
+        pred_pts = []
+        steps = int(PREDICT_HORIZON_S / PREDICT_DT_S)
+        for k in range(1, steps + 1):
+            tau = k * PREDICT_DT_S
+            px = p1[0] + v1[0] * tau
+            py = p1[1] + v1[1] * tau
+            pred_pts.append((int(px), int(py)))
+
+        if len(pred_pts) >= 2:
+            pred_arr = np.array(pred_pts, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(out, [pred_arr], False, (255, 0, 255), 3)  # magenta future path
+
+        cv2.putText(out, f"R1 v(px/s)=({v1[0]:.1f},{v1[1]:.1f})",
+                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # If chaser is seen, compute and draw IP like your sketch
+        if seen2 and p2 is not None:
+            t_int = solve_intercept_time(pT=p1, vT=v1, pC=p2, sC=CHASER_SPEED_PX_S, t_cap=MAX_INTERCEPT_T)
+
+            if t_int is not None:
+                ip = p1 + v1 * t_int
+                ip_int = (int(ip[0]), int(ip[1]))
+
+                # Draw IP as "X"
+                draw_x(out, ip_int, size=14, color=(255, 0, 255), thickness=3)
+                cv2.putText(out, f"IP (t={t_int:.2f}s)", (ip_int[0] + 10, ip_int[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2, cv2.LINE_AA)
+
+                # Draw line from chaser to IP (intended intercept trajectory)
+                p2_int = (int(p2[0]), int(p2[1]))
+                cv2.line(out, p2_int, ip_int, (255, 0, 255), 2, cv2.LINE_AA)
+
+                # Optional: show also where chaser could be after t_int if moving straight at max speed
+                # (visual sanity check)
+                cv2.putText(out, f"sC={CHASER_SPEED_PX_S:.0f}px/s",
+                            (20, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+            else:
+                cv2.putText(out, "IP: no feasible intercept (target too fast / bad data)",
+                            (20, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
+
+    else:
+        cv2.putText(out, "R1 prediction: waiting for enough samples",
+                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # HUD
+    loop_end = time.perf_counter()
+    fps = 1.0 / (loop_end - loop_start + 1e-9)
+    cv2.putText(out, f"FPS: {fps:.1f} | 'c' clear | 'q' quit",
+                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+
+    cv2.imshow("frame", out)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    if key == ord('c'):
+        hist1.clear()
+        hist2.clear()
+        trail1.clear()
+        pos1_filt = None
+        pos2_filt = None
+        last_trail1_pt = None
+
+cap.release()
+cv2.destroyAllWindows()
+exit(0)
