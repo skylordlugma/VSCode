@@ -1,0 +1,141 @@
+import cv2
+import numpy as np
+import time
+
+# ----------------------------
+# CONFIG
+# ----------------------------
+CAM_INDEX = 1                # change if needed
+ARROW_LEN_PX = 80            # constant arrow length in pixels        
+MIN_SPEED_PX_S = 10.0        # below this, don't draw arrow (noise/jitter)
+POS_EMA_ALPHA = 0.4          # position smoothing (0..1). Higher = more responsive
+VEL_EMA_ALPHA = 0.35         # velocity smoothing (0..1)
+
+# HoughCircles tuning (you WILL need to tune these to your camera/ball size)
+DP = 1.2
+MIN_DIST = 40
+PARAM1 = 120                 # Canny high threshold inside Hough
+PARAM2 = 30                  # accumulator threshold; lower = more detections (more false positives)
+MIN_RADIUS = 10
+MAX_RADIUS = 50
+
+# ----------------------------
+# HELPERS
+# ----------------------------
+def ema(prev, new, alpha):
+    if prev is None:
+        return new
+    return (1 - alpha) * prev + alpha * new
+
+def norm2(v):
+    return float(np.sqrt(v[0]*v[0] + v[1]*v[1]))
+
+# ----------------------------
+# MAIN
+# ----------------------------
+cap = cv2.VideoCapture(CAM_INDEX)
+if not cap.isOpened():
+    raise RuntimeError("Could not open camera.")
+
+prev_t = None
+pos_f = None          # filtered position (float x,y)
+vel_f = None          # filtered velocity (float vx,vy) in px/s
+
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+
+    t = time.time()
+    if prev_t is None:
+        prev_t = t
+
+    # Preprocess
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (9, 9), 2)
+
+    # Detect circles
+    circles = cv2.HoughCircles(
+        gray, cv2.HOUGH_GRADIENT,
+        dp=DP,
+        minDist=MIN_DIST,
+        param1=PARAM1,
+        param2=PARAM2,
+        minRadius=MIN_RADIUS,
+        maxRadius=MAX_RADIUS
+    )
+
+    if circles is not None:
+        circles = np.squeeze(circles).astype(np.float32)
+        if circles.ndim == 1:
+            circles = circles[None, :]  # ensure shape (N,3)
+
+        # Pick "best" circle:
+        # - simplest choice: largest radius (often the real ball if it's closest/biggest)
+        circles = sorted(circles, key=lambda c: c[2], reverse=True)
+        x, y, r = circles[0]
+        cx, cy = float(x), float(y)
+
+        # Position filtering
+        pos_f = ema(pos_f, np.array([cx, cy], dtype=np.float32), POS_EMA_ALPHA)
+
+        # Velocity estimate (px/s) from filtered position
+        dt = max(1e-6, t - prev_t)
+        if pos_f is not None:
+            # Use previous filtered position for stable velocity
+            if 'pos_f_prev' not in locals() or pos_f_prev is None:
+                pos_f_prev = pos_f.copy()
+
+            v = (pos_f - pos_f_prev) / dt  # px/s
+            vel_f = ema(vel_f, v, VEL_EMA_ALPHA)
+
+            pos_f_prev = pos_f.copy()
+
+        prev_t = t
+
+        # Draw detected circle + center
+        c_int = (int(pos_f[0]), int(pos_f[1]))
+        cv2.circle(frame, (int(x), int(y)), int(r), (0, 255, 0), 2)
+        cv2.circle(frame, c_int, 4, (0, 0, 255), -1)
+
+        # Draw constant-length direction arrow
+        if vel_f is not None:
+            speed = norm2(vel_f)
+
+            if speed >= MIN_SPEED_PX_S:
+                direction = vel_f / max(speed, 1e-6)   # unit vector
+
+                tip = (
+                    int(pos_f[0] + direction[0] * ARROW_LEN_PX),
+                    int(pos_f[1] + direction[1] * ARROW_LEN_PX)
+                )
+
+                cv2.arrowedLine(
+                    frame,
+                    c_int,
+                    tip,
+                    (255, 0, 0),
+                    3,
+                    tipLength=0.25
+                )
+
+                cv2.putText(frame, "direction", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+            else:
+                cv2.putText(frame, "speed~0 (holding)", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2)
+        
+
+    else:
+        # If no circle found, keep time update but don't crash
+        prev_t = t
+        cv2.putText(frame, "No circle detected", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+    cv2.imshow("Sphere Direction (HoughCircles)", frame)
+    key = cv2.waitKey(1) & 0xFF
+    if key == 27 or key == ord('q'):  # ESC or q
+        break
+
+cap.release()
+cv2.destroyAllWindows()

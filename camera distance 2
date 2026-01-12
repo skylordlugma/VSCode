@@ -23,7 +23,8 @@ CHASER_SPEED_PX_S = 250.0     # <-- tune to match robot 2 max speed as seen in i
 # Safety/tuning
 MAX_INTERCEPT_T = 3.0         # cap intercept time (seconds) for drawing/robustness
 
-
+PATH_LEN_PX = 800        # constant predicted path length on screen (tune)
+MIN_SPEED_PX_S = 0.0    # below this, heading is unreliable (tune)
 
 # ----------------------------
 # ArUco setup
@@ -195,53 +196,59 @@ while True:
         pts = np.array(trail1, dtype=np.int32).reshape((-1, 1, 2))
         cv2.polylines(out, [pts], False, (0, 255, 255), 2)
 
-    # Estimate target velocity, draw prediction, and intercept point
+    # Estimate target velocity, draw constant-length predicted path, and perpendicular intercept
     v1 = estimate_velocity(hist1)
+
     if seen1 and p1 is not None and v1 is not None:
-        # Draw target prediction polyline
-        pred_pts = []
-        steps = int(PREDICT_HORIZON_S / PREDICT_DT_S)
-        for k in range(1, steps + 1):
-            tau = k * PREDICT_DT_S
-            px = p1[0] + v1[0] * tau
-            py = p1[1] + v1[1] * tau
-            pred_pts.append((int(px), int(py)))
+        speed = float(np.linalg.norm(v1))
 
-        if len(pred_pts) >= 2:
-            pred_arr = np.array(pred_pts, dtype=np.int32).reshape((-1, 1, 2))
-            cv2.polylines(out, [pred_arr], False, (255, 0, 255), 3)  # magenta future path
+        if speed >= MIN_SPEED_PX_S:
+            u = (v1 / speed).astype(np.float64)  # unit heading direction
+            A = p1.astype(np.float64)            # start of predicted path at Robot 1
+            B = (p1 + u * PATH_LEN_PX).astype(np.float64)  # fixed-length endpoint
 
-        cv2.putText(out, f"R1 v(px/s)=({v1[0]:.1f},{v1[1]:.1f})",
-                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+            A_int = (int(A[0]), int(A[1]))
+            B_int = (int(B[0]), int(B[1]))
 
-        # If chaser is seen, compute and draw IP like your sketch
-        if seen2 and p2 is not None:
-            t_int = solve_intercept_time(pT=p1, vT=v1, pC=p2, sC=CHASER_SPEED_PX_S, t_cap=MAX_INTERCEPT_T)
+            # Draw predicted path as a fixed-length line
+            cv2.line(out, A_int, B_int, (255, 0, 255), 3, cv2.LINE_AA)
 
-            if t_int is not None:
-                ip = p1 + v1 * t_int
-                ip_int = (int(ip[0]), int(ip[1]))
+            cv2.putText(out, f"R1 v(px/s)=({v1[0]:.1f},{v1[1]:.1f})",
+                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                    (255, 255, 255), 2, cv2.LINE_AA)
 
-                # Draw IP as "X"
-                draw_x(out, ip_int, size=14, color=(255, 0, 255), thickness=3)
-                cv2.putText(out, f"IP (t={t_int:.2f}s)", (ip_int[0] + 10, ip_int[1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2, cv2.LINE_AA)
+            # Draw perpendicular interception line from Robot 2 to the predicted path segment
+            if seen2 and p2 is not None:
+                P = p2.astype(np.float64)
 
-                # Draw line from chaser to IP (intended intercept trajectory)
-                p2_int = (int(p2[0]), int(p2[1]))
-                cv2.line(out, p2_int, ip_int, (255, 0, 255), 2, cv2.LINE_AA)
+                # projection scalar along the path direction (pixels)
+                t = float(np.dot(P - A, u))
 
-                # Optional: show also where chaser could be after t_int if moving straight at max speed
-                # (visual sanity check)
-                cv2.putText(out, f"sC={CHASER_SPEED_PX_S:.0f}px/s",
-                            (20, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
-            else:
-                cv2.putText(out, "IP: no feasible intercept (target too fast / bad data)",
-                            (20, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
+                # clamp to the visible segment [0, PATH_LEN_PX]
+                t_clamped = float(np.clip(t, 0.0, float(PATH_LEN_PX)))
+
+                # foot of perpendicular on the segment
+                F = A + u * t_clamped
+                F_int = (int(F[0]), int(F[1]))
+                P_int = (int(P[0]), int(P[1]))
+
+                # perpendicular line (Robot 2 -> foot point)
+                cv2.line(out, P_int, F_int, (255, 0, 255), 2, cv2.LINE_AA)
+
+                # mark intercept point as X
+                draw_x(out, F_int, size=14, color=(255, 0, 255), thickness=3)
+                cv2.putText(out, "IP", (F_int[0] + 10, F_int[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2, cv2.LINE_AA)
+
+        else:
+            cv2.putText(out, "Predicted path: speed too low / heading unstable",
+                        (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                        (0, 0, 255), 2, cv2.LINE_AA)
 
     else:
         cv2.putText(out, "R1 prediction: waiting for enough samples",
-                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+                        (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                        (255, 255, 255), 2, cv2.LINE_AA)
 
     # HUD
     loop_end = time.perf_counter()

@@ -1,0 +1,186 @@
+"""
+SAFE DEMO VERSION — Robust ArUco under scratched / reflective dome
+Strategy:
+- Central ROI crop (biggest practical win)
+- Conservative preprocessing (median + optional highlight clamp)
+- Standard ArUco detection (NO quad mask / no Canny-based gating)
+- Optional temporal confirmation (N-of-M) to reduce flicker
+
+Quit: ESC or 'q'
+Adjust ROI: '[' smaller, ']' larger
+
+Based on the standard ME32088 workflow (gray -> detectMarkers -> draw). :contentReference[oaicite:0]{index=0}
+"""
+
+import cv2
+import numpy as np
+import cv2.aruco as aruco
+from collections import deque, Counter
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+CAM_INDEX = 1
+ARUCO_DICT = aruco.DICT_4X4_50
+
+# ROI central crop (square radius as fraction of min(h,w))
+ROI_RADIUS_FRAC_DEFAULT = 0.35  # live adjust with [ ]
+
+# Glare handling
+HIGHLIGHT_CLAMP = 230  # set None to disable (try 220–240 if glare is strong)
+
+# Preprocess
+MEDIAN_K = 5  # 3 or 5; 7 if very noisy (but too high can blur marker edges)
+
+# Temporal filtering (stable IDs)
+USE_TEMPORAL_FILTER = True
+M_FRAMES = 8   # history length
+N_HITS = 3     # must appear in >= N frames within last M
+
+# Debug windows
+SHOW_DEBUG = True
+
+
+def make_detector():
+    aruco_dict = aruco.getPredefinedDictionary(ARUCO_DICT)
+    p = aruco.DetectorParameters()
+
+    # Keep these reasonably conservative for dome conditions
+    p.adaptiveThreshWinSizeMin = 7
+    p.adaptiveThreshWinSizeMax = 35
+    p.adaptiveThreshWinSizeStep = 7
+    p.adaptiveThreshConstant = 10
+
+    # Candidate size tolerance (do NOT crank minMarkerPerimeterRate too high in demo mode)
+    p.minMarkerPerimeterRate = 0.03
+    p.maxMarkerPerimeterRate = 4.0
+
+    # Corner refinement helps stability
+    p.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+    p.cornerRefinementWinSize = 5
+    p.cornerRefinementMaxIterations = 30
+    p.cornerRefinementMinAccuracy = 0.1
+
+    detector = aruco.ArucoDetector(aruco_dict, p) if hasattr(aruco, "ArucoDetector") else None
+    return aruco_dict, p, detector
+
+
+def central_roi(img, radius_frac):
+    h, w = img.shape[:2]
+    r = int(radius_frac * min(h, w))
+    cx, cy = w // 2, h // 2
+    x0, x1 = max(0, cx - r), min(w, cx + r)
+    y0, y1 = max(0, cy - r), min(h, cy + r)
+    return img[y0:y1, x0:x1], (x0, y0)
+
+
+def preprocess(gray):
+    g = cv2.medianBlur(gray, MEDIAN_K)
+    if HIGHLIGHT_CLAMP is not None:
+        g = np.minimum(g, HIGHLIGHT_CLAMP).astype(np.uint8)
+    return g
+
+
+def offset_corners(corners, dx, dy):
+    out = []
+    for c in corners:
+        c2 = c.copy()
+        c2[:, :, 0] += dx
+        c2[:, :, 1] += dy
+        out.append(c2)
+    return out
+
+
+def detect(gray, aruco_dict, params, detector=None):
+    if detector is not None:
+        corners, ids, rejected = detector.detectMarkers(gray)
+    else:
+        corners, ids, rejected = aruco.detectMarkers(gray, aruco_dict, parameters=params)
+    return corners, ids, rejected
+
+
+def stable_ids_from_history(history, n_hits):
+    flat = [i for frame_ids in history for i in frame_ids]
+    counts = Counter(flat)
+    stable = [i for i, c in counts.items() if c >= n_hits]
+    stable.sort()
+    return stable
+
+
+def main():
+    aruco_dict, params, detector = make_detector()
+
+    cap = cv2.VideoCapture(CAM_INDEX)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera index {CAM_INDEX}")
+
+    roi_radius_frac = ROI_RADIUS_FRAC_DEFAULT
+
+    history = deque(maxlen=M_FRAMES)  # list of detected IDs per frame
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            continue
+
+        roi_bgr, (x0, y0) = central_roi(frame, roi_radius_frac)
+        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+        g = preprocess(gray)
+
+        corners, ids, rejected = detect(g, aruco_dict, params, detector)
+
+        detected_ids = []
+        if ids is not None:
+            detected_ids = [int(v) for v in ids.flatten()]
+        history.append(detected_ids)
+
+        stable = []
+        if USE_TEMPORAL_FILTER:
+            stable = stable_ids_from_history(history, N_HITS)
+        else:
+            stable = detected_ids
+
+        vis = frame.copy()
+
+        # ROI rectangle
+        cv2.rectangle(
+            vis,
+            (x0, y0),
+            (x0 + roi_bgr.shape[1], y0 + roi_bgr.shape[0]),
+            (255, 255, 0),
+            2,
+        )
+
+        # Draw detections (offset back to full frame coords)
+        if ids is not None:
+            aruco.drawDetectedMarkers(vis, offset_corners(corners, x0, y0), ids)
+
+        # Display stable IDs
+        if stable:
+            txt = f"STABLE IDs (>= {N_HITS}/{M_FRAMES}): " + ", ".join(map(str, stable))
+            cv2.putText(vis, txt, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        else:
+            cv2.putText(vis, "STABLE IDs: none", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+
+        cv2.imshow("SAFE DEMO ArUco (full)", vis)
+
+        if SHOW_DEBUG:
+            cv2.imshow("ROI", roi_bgr)
+            cv2.imshow("ROI gray (preprocessed)", g)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key in (27, ord('q')):  # ESC or q
+            break
+        elif key == ord('['):
+            roi_radius_frac = max(0.15, roi_radius_frac - 0.05)
+            print(f"ROI_RADIUS_FRAC -> {roi_radius_frac:.2f}")
+        elif key == ord(']'):
+            roi_radius_frac = min(0.49, roi_radius_frac + 0.05)
+            print(f"ROI_RADIUS_FRAC -> {roi_radius_frac:.2f}")
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
