@@ -16,8 +16,8 @@ DP = 1.2
 MIN_DIST = 40
 PARAM1 = 120                 # Canny high threshold inside Hough
 PARAM2 = 30                  # accumulator threshold; lower = more detections (more false positives)
-MIN_RADIUS = 10
-MAX_RADIUS = 50
+MIN_RADIUS = 30
+MAX_RADIUS = 40
 
 # ----------------------------
 # HELPERS
