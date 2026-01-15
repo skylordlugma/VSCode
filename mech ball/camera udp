@@ -1,0 +1,115 @@
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+import socket
+import time
+
+# ----------------------------
+# CONFIG
+# ----------------------------
+CRITICAL_ID = 1
+CAM_INDEX = 1
+
+UDP_IP = "138.38.229.153"
+UDP_PORT = 5005
+
+TRIGGER_BYTE = b'\x01'
+PULSE_DURATION_S = 1.0        # <<< send for 1 second
+REARM_TIMEOUT_S = 5.0
+
+SEND_RATE_HZ = 30             # UDP packets per second during pulse
+
+USE_CLAHE = True
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if USE_CLAHE else None
+
+# ----------------------------
+# UDP setup
+# ----------------------------
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+# ----------------------------
+# ArUco setup
+# ----------------------------
+aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+parameters = aruco.DetectorParameters()
+
+cap = cv2.VideoCapture(CAM_INDEX)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+
+# ----------------------------
+# Trigger state
+# ----------------------------
+armed = True
+pulse_active = False
+pulse_start_time = None
+last_seen_time = None
+last_send_time = 0.0
+
+send_interval = 1.0 / SEND_RATE_HZ
+
+while True:
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        break
+
+    now = time.perf_counter()
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if USE_CLAHE:
+        gray = clahe.apply(gray)
+
+    corners, ids, _ = aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
+
+    critical_seen = False
+    if ids is not None:
+        critical_seen = CRITICAL_ID in ids.flatten().astype(int)
+        aruco.drawDetectedMarkers(frame, corners, ids)
+
+    # ----------------------------
+    # ENTRY → start pulse
+    # ----------------------------
+    if critical_seen:
+        last_seen_time = now
+
+        if armed and not pulse_active:
+            pulse_active = True
+            pulse_start_time = now
+            last_send_time = 0.0
+            armed = False
+            print("ENTRY detected → starting 1 s UDP pulse")
+
+    # ----------------------------
+    # SEND during pulse window
+    # ----------------------------
+    if pulse_active:
+        if (now - pulse_start_time) <= PULSE_DURATION_S:
+            if (now - last_send_time) >= send_interval:
+                sock.sendto(TRIGGER_BYTE, (UDP_IP, UDP_PORT))
+                last_send_time = now
+        else:
+            pulse_active = False
+            print("Pulse finished")
+
+    # ----------------------------
+    # RE-ARM after absence
+    # ----------------------------
+    if not critical_seen and not armed:
+        if last_seen_time is not None and (now - last_seen_time) >= REARM_TIMEOUT_S:
+            armed = True
+            print("Re-armed after absence")
+
+    # ----------------------------
+    # UI
+    # ----------------------------
+    if pulse_active:
+        cv2.putText(frame, "UDP PULSE ACTIVE", (30, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+
+    cv2.imshow("frame", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+sock.close()
