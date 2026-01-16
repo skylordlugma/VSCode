@@ -11,7 +11,7 @@ CRITICAL_ID = 1
 CAM_INDEX = 1
 
 UDP_IP = "138.38.229.153"
-UDP_PORT = 5005
+UDP_PORT = 671
 
 TRIGGER_BYTE = b'\x01'
 PULSE_DURATION_S = 1.0        # <<< send for 1 second

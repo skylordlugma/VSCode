@@ -1,0 +1,554 @@
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+import time
+from collections import deque, Counter
+import socket
+import struct
+import math
+
+# ============================================================
+# CONFIG
+# ============================================================
+ROBOT1_ID = 1                 # Target robot marker ID
+ROBOT2_ID = 2                 # Chaser robot marker ID
+
+MAX_HISTORY = 30              # points used for velocity estimation
+ALPHA_POS = 0.35              # EMA smoothing for position
+MIN_STEP_PX = 2               # ignore jitter smaller than this
+
+# Robot 1 prediction / drawing
+PATH_LEN_PX = 800             # draw R1 velocity ray this long (for viz)
+MIN_SPEED_PX_S = 15.0         # below this, R1 heading unreliable
+
+# Bitflip / robustness controls
+USE_CLAHE = True
+USE_BILATERAL = True
+ID_VOTE_WINDOW = 7
+ID_MIN_VOTES = 4
+GATE_DIST_PX = 25
+LOST_TIMEOUT_S = 0.35
+
+# Camera control (if supported by your camera driver)
+TRY_DISABLE_AUTO_EXPOSURE = True
+MANUAL_EXPOSURE = -6
+MANUAL_GAIN = 0
+
+# ============================================================
+# UDP OUTPUT (Robot2 angle-to-IP)
+# ============================================================
+UDP_IP = "138.38.229.153"
+UDP_PORT = 672
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+FLIP_ANGLE_SIGN = False
+HEADING_OFFSET_RAD = 0.0
+
+# Send rate limiting (recommended so Simulink doesn't see 60Hz jitter)
+SEND_RATE_HZ = 50.0           # set None or 0 to disable rate limit
+SEND_MIN_DT = (1.0 / SEND_RATE_HZ) if (SEND_RATE_HZ is not None and SEND_RATE_HZ > 0) else 0.0
+
+# ============================================================
+# CHASER SPEED (sphere = 1.66 m/s) -> MUST BE IN px/s
+# ============================================================
+SPHERE_SPEED_M_S = 1.66
+PX_PER_M = 100.0              # <-- CALIBRATE THIS (pixels per metre for your camera + height)
+CHASER_SPEED_PX_S = SPHERE_SPEED_M_S * PX_PER_M
+
+# Max intercept look-ahead time
+MAX_INTERCEPT_T = 3.0
+
+# ============================================================
+# IP STABILITY / ARM-THEN-STREAM CONTROL
+# ============================================================
+IP_STABLE_PX = 6.0            # max IP movement per frame to be considered stable
+IP_STABLE_FRAMES = 10         # consecutive stable frames required to arm tracking
+IP_LOST_RESET_S = 0.30        # if no IP for this long, disarm/re-arm
+
+# ============================================================
+# Angle-sent indicator (HUD)
+# ============================================================
+ANGLE_SENT_SHOW_S = 2.0
+last_sent_angle = None
+last_sent_time = None
+last_udp_sent_time = None     # for rate limiting
+
+# ============================================================
+# ArUco setup
+# ============================================================
+aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+parameters = aruco.DetectorParameters()
+
+# Detector tuning for glare/noisy thresholding
+parameters.adaptiveThreshWinSizeMin = 3
+parameters.adaptiveThreshWinSizeMax = 35
+parameters.adaptiveThreshWinSizeStep = 4
+
+parameters.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+parameters.cornerRefinementWinSize = 5
+parameters.cornerRefinementMaxIterations = 30
+parameters.cornerRefinementMinAccuracy = 0.1
+
+parameters.minMarkerPerimeterRate = 0.03
+parameters.maxMarkerPerimeterRate = 4.0
+parameters.perspectiveRemoveIgnoredMarginPerCell = 0.2
+parameters.perspectiveRemovePixelPerCell = 8
+
+cap = cv2.VideoCapture(1)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+
+# Try to reduce saturation from glare by reducing auto exposure / gain
+if TRY_DISABLE_AUTO_EXPOSURE:
+    try:
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        cap.set(cv2.CAP_PROP_EXPOSURE, float(MANUAL_EXPOSURE))
+        cap.set(cv2.CAP_PROP_GAIN, float(MANUAL_GAIN))
+    except Exception:
+        pass
+
+cv2.namedWindow("frame", cv2.WINDOW_AUTOSIZE)
+
+# ============================================================
+# Helpers
+# ============================================================
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if USE_CLAHE else None
+
+def preprocess_gray(frame_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    if USE_CLAHE and clahe is not None:
+        gray = clahe.apply(gray)
+    if USE_BILATERAL:
+        gray = cv2.bilateralFilter(gray, 5, 50, 50)
+    return gray
+
+def centroid_from_corners(corners_4x2: np.ndarray) -> np.ndarray:
+    return np.mean(corners_4x2, axis=0)
+
+def estimate_velocity(history_deque):
+    """Least-squares fit x(t), y(t) -> velocity (vx,vy) in px/s."""
+    if len(history_deque) < 6:
+        return None
+    t = np.array([h[0] for h in history_deque], dtype=np.float64)
+    p = np.array([h[1] for h in history_deque], dtype=np.float64)  # (N,2)
+    t0 = t[0]
+    tt = t - t0
+    A = np.vstack([tt, np.ones_like(tt)]).T  # (N,2)
+    vx, _bx = np.linalg.lstsq(A, p[:, 0], rcond=None)[0]
+    vy, _by = np.linalg.lstsq(A, p[:, 1], rcond=None)[0]
+    return np.array([float(vx), float(vy)], dtype=np.float64)
+
+def draw_x(img, pt, size=12, color=(255, 0, 255), thickness=3):
+    x, y = pt
+    cv2.line(img, (x - size, y - size), (x + size, y + size), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x - size, y + size), (x + size, y - size), color, thickness, cv2.LINE_AA)
+
+def dist2(a, b):
+    dx = float(a[0] - b[0])
+    dy = float(a[1] - b[1])
+    return dx*dx + dy*dy
+
+def majority_vote(id_deque):
+    """Return (winner_id, votes) or (None, 0) if empty."""
+    if not id_deque:
+        return None, 0
+    c = Counter(id_deque)
+    winner, votes = c.most_common(1)[0]
+    return int(winner), int(votes)
+
+def wrap_to_pi(a: float) -> float:
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+def angle_from_vec(vx: float, vy: float) -> float:
+    """Angle of vector in image coords (x right, y down)."""
+    return math.atan2(vy, vx)
+
+def draw_banner(out_img, text, top_left=(20, 260), pad=10,
+                bg_color=(0, 200, 0), text_color=(255, 255, 255)):
+    x, y = top_left
+    (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2)
+    w = tw + 2 * pad
+    h = th + baseline + 2 * pad
+    cv2.rectangle(out_img, (x, y), (x + w, y + h), bg_color, -1)
+    cv2.putText(out_img, text, (x + pad, y + pad + th),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85, text_color, 2, cv2.LINE_AA)
+
+def compute_intercept_point(p1, v1, p2, chaser_speed, t_max=5.0):
+    """
+    Solve ||(p1 + v1*t) - p2|| = chaser_speed*t for t>=0.
+    Returns (ip_point, t_hit) or (None, None) if no feasible intercept.
+    All units must be consistent (px, px/s).
+    """
+    r = (p1 - p2).astype(np.float64)
+    v = v1.astype(np.float64)
+    s = float(chaser_speed)
+
+    a = float(np.dot(v, v) - s*s)
+    b = float(2.0 * np.dot(r, v))
+    c = float(np.dot(r, r))
+
+    # Near-linear case
+    if abs(a) < 1e-9:
+        if abs(b) < 1e-9:
+            return None, None
+        t = -c / b
+        if t > 0.0:
+            t = min(t, t_max)
+            return (p1 + v1 * t).astype(np.float64), float(t)
+        return None, None
+
+    disc = b*b - 4.0*a*c
+    if disc < 0.0:
+        return None, None
+
+    sqrt_disc = math.sqrt(disc)
+    t1 = (-b - sqrt_disc) / (2.0*a)
+    t2 = (-b + sqrt_disc) / (2.0*a)
+
+    candidates = [t for t in (t1, t2) if t > 0.0]
+    if not candidates:
+        return None, None
+
+    t = min(candidates)
+    if t > t_max:
+        return None, None
+
+    ip = (p1 + v1 * t).astype(np.float64)
+    return ip, float(t)
+
+# ============================================================
+# State buffers
+# ============================================================
+hist1 = deque(maxlen=MAX_HISTORY)  # (t, [x,y])
+hist2 = deque(maxlen=MAX_HISTORY)
+
+trail1 = deque(maxlen=400)
+pos1_filt = None
+pos2_filt = None
+last_trail1_pt = None
+
+# ID voting buffers (to mitigate bitflips)
+id_votes_r1 = deque(maxlen=ID_VOTE_WINDOW)
+id_votes_r2 = deque(maxlen=ID_VOTE_WINDOW)
+
+# Last-seen time for dropout handling
+last_seen_r1_t = None
+last_seen_r2_t = None
+
+# IP stability / arm state
+ip_last = None
+ip_stable_count = 0
+ip_last_seen_t = None
+tracking_armed = False
+
+while True:
+    loop_start = time.perf_counter()
+
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        print("Failed to grab frame.")
+        break
+
+    now = time.perf_counter()
+    gray = preprocess_gray(frame)
+
+    corners, ids, rejected = aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
+
+    out = frame.copy()
+
+    # Default: not seen this frame
+    seen1 = False
+    seen2 = False
+    p1 = None
+    p2 = None
+    r2_corners = None  # store chosen Robot2 marker corners for heading
+
+    # --- detect & draw ---
+    if ids is not None and len(ids) > 0:
+        ids_flat = ids.flatten().astype(int)
+        aruco.drawDetectedMarkers(out, corners, ids)
+
+        # Build list of detections with centroid for gating / picking the correct one
+        detections = []
+        for i, mid in enumerate(ids_flat):
+            c = corners[i][0]  # (4,2)
+            pt = centroid_from_corners(c)
+            detections.append((int(mid), pt, i))
+
+        # Feed vote buffers with any occurrences of expected IDs
+        for mid, pt, i in detections:
+            if mid == ROBOT1_ID:
+                id_votes_r1.append(mid)
+            if mid == ROBOT2_ID:
+                id_votes_r2.append(mid)
+
+        # Apply ID voting (stabilise presence)
+        r1_id, r1_votes = majority_vote(id_votes_r1)
+        r2_id, r2_votes = majority_vote(id_votes_r2)
+
+        r1_allowed = (r1_id == ROBOT1_ID and r1_votes >= ID_MIN_VOTES)
+        r2_allowed = (r2_id == ROBOT2_ID and r2_votes >= ID_MIN_VOTES)
+
+        # Choose the best detection for each robot:
+        def pick_robot_detection(expected_id, last_pos_filt, allowed):
+            if not detections:
+                return None
+
+            candidates = [(mid, pt, i) for (mid, pt, i) in detections if mid == expected_id]
+            if allowed and candidates:
+                if last_pos_filt is None:
+                    return candidates[0]
+                candidates.sort(key=lambda x: dist2(x[1], last_pos_filt))
+                return candidates[0]
+
+            # Gate by proximity if ID vote doesn't allow yet
+            if last_pos_filt is not None:
+                close = [(mid, pt, i) for (mid, pt, i) in detections
+                         if dist2(pt, last_pos_filt) <= GATE_DIST_PX*GATE_DIST_PX]
+                if close:
+                    close.sort(key=lambda x: dist2(x[1], last_pos_filt))
+                    return close[0]
+
+            return None
+
+        pick1 = pick_robot_detection(ROBOT1_ID, pos1_filt, r1_allowed)
+        pick2 = pick_robot_detection(ROBOT2_ID, pos2_filt, r2_allowed)
+
+        # Update Robot 1 state if selected
+        if pick1 is not None:
+            mid, pt, idx = pick1
+            seen1 = True
+            last_seen_r1_t = now
+
+            if pos1_filt is None:
+                pos1_filt = pt.copy()
+            else:
+                pos1_filt = (1.0 - ALPHA_POS) * pos1_filt + ALPHA_POS * pt
+
+            p1 = pos1_filt
+            hist1.append((now, p1.copy()))
+
+            p1_int = (int(p1[0]), int(p1[1]))
+            if last_trail1_pt is None:
+                trail1.append(p1_int)
+                last_trail1_pt = p1_int
+            else:
+                dx = p1_int[0] - last_trail1_pt[0]
+                dy = p1_int[1] - last_trail1_pt[1]
+                if dx*dx + dy*dy >= MIN_STEP_PX*MIN_STEP_PX:
+                    trail1.append(p1_int)
+                    last_trail1_pt = p1_int
+
+            cv2.circle(out, p1_int, 6, (0, 255, 0), -1)
+            cv2.putText(out, f"R1 ID:{ROBOT1_ID}", (p1_int[0] + 10, p1_int[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+
+        # Update Robot 2 state if selected
+        if pick2 is not None:
+            mid, pt, idx = pick2
+            seen2 = True
+            last_seen_r2_t = now
+
+            # Store corners for heading calculation
+            r2_corners = corners[idx][0]  # (4,2)
+
+            if pos2_filt is None:
+                pos2_filt = pt.copy()
+            else:
+                pos2_filt = (1.0 - ALPHA_POS) * pos2_filt + ALPHA_POS * pt
+
+            p2 = pos2_filt
+            hist2.append((now, p2.copy()))
+
+            p2_int = (int(p2[0]), int(p2[1]))
+            cv2.circle(out, p2_int, 6, (255, 255, 0), -1)
+            cv2.putText(out, f"R2 ID:{ROBOT2_ID}", (p2_int[0] + 10, p2_int[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2, cv2.LINE_AA)
+
+    # --- handle brief dropouts (use last known state) ---
+    if not seen1 and last_seen_r1_t is not None and (now - last_seen_r1_t) <= LOST_TIMEOUT_S:
+        p1 = pos1_filt
+        seen1 = p1 is not None
+    if not seen2 and last_seen_r2_t is not None and (now - last_seen_r2_t) <= LOST_TIMEOUT_S:
+        p2 = pos2_filt
+        seen2 = p2 is not None
+
+    # If IP has been missing for a while, disarm (re-arm later)
+    if ip_last_seen_t is not None and (now - ip_last_seen_t) > IP_LOST_RESET_S:
+        ip_stable_count = 0
+        ip_last = None
+        ip_last_seen_t = None
+        tracking_armed = False
+
+    # Draw Robot 1 past trail
+    if len(trail1) >= 2:
+        pts = np.array(trail1, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(out, [pts], False, (0, 255, 255), 2)
+
+    # ============================================================
+    # Predicted ray for Robot1 + True Intercept Point (IP)
+    # ============================================================
+    v1 = estimate_velocity(hist1)
+    if seen1 and p1 is not None and v1 is not None:
+        speed1 = float(np.linalg.norm(v1))
+
+        cv2.putText(out, f"R1 v(px/s)=({v1[0]:.1f},{v1[1]:.1f}) | |v|={speed1:.1f}",
+                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+
+        if speed1 >= MIN_SPEED_PX_S:
+            A = p1.astype(np.float64)
+            u = (v1 / (speed1 + 1e-12)).astype(np.float64)
+            B = (A + u * float(PATH_LEN_PX)).astype(np.float64)
+
+            cv2.line(out, (int(A[0]), int(A[1])), (int(B[0]), int(B[1])),
+                     (255, 0, 255), 3, cv2.LINE_AA)
+
+            if seen2 and p2 is not None:
+                P = p2.astype(np.float64)
+
+                IP, t_hit = compute_intercept_point(
+                    p1=A,
+                    v1=v1,
+                    p2=P,
+                    chaser_speed=CHASER_SPEED_PX_S,
+                    t_max=MAX_INTERCEPT_T
+                )
+
+                if IP is not None:
+                    IP_int = (int(IP[0]), int(IP[1]))
+                    P_int = (int(P[0]), int(P[1]))
+
+                    cv2.line(out, P_int, IP_int, (255, 0, 255), 2, cv2.LINE_AA)
+                    draw_x(out, IP_int, size=14, color=(255, 0, 255), thickness=3)
+                    cv2.putText(out, f"IP (t={t_hit:.2f}s)", (IP_int[0] + 10, IP_int[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2, cv2.LINE_AA)
+
+                    # ---- IP stability tracking ----
+                    ip_last_seen_t = now
+                    if ip_last is None:
+                        ip_last = IP.copy()
+                        ip_stable_count = 0
+                    else:
+                        step = float(np.linalg.norm(IP - ip_last))
+                        if step <= IP_STABLE_PX:
+                            ip_stable_count += 1
+                        else:
+                            ip_stable_count = 0
+                        ip_last = IP.copy()
+
+                    ip_is_stable = (ip_stable_count >= IP_STABLE_FRAMES)
+
+                    # Arm once the first time IP is stable; then stream continuously even if IP moves later
+                    if (not tracking_armed) and ip_is_stable:
+                        tracking_armed = True
+
+                    cv2.putText(out,
+                                f"IP stable: {ip_is_stable} ({ip_stable_count}/{IP_STABLE_FRAMES}) | armed:{tracking_armed}",
+                                (20, 215), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                (255, 255, 255), 2, cv2.LINE_AA)
+
+                    # ---- STREAM UDP ANGLE ONCE ARMED ----
+                    if tracking_armed and (r2_corners is not None):
+                        # Rate limit (optional)
+                        can_send = True
+                        if SEND_MIN_DT > 0.0 and last_udp_sent_time is not None:
+                            can_send = (now - last_udp_sent_time) >= SEND_MIN_DT
+
+                        if can_send:
+                            # Robot2 heading from marker edge (TL->TR)
+                            c0 = r2_corners[0]  # TL
+                            c1 = r2_corners[1]  # TR
+                            hx = float(c1[0] - c0[0])
+                            hy = float(c1[1] - c0[1])
+
+                            heading = angle_from_vec(hx, hy)
+                            heading = wrap_to_pi(heading + HEADING_OFFSET_RAD)
+
+                            # Desired direction: Robot2 -> IP
+                            dx = float(IP[0] - P[0])
+                            dy = float(IP[1] - P[1])
+                            desired = angle_from_vec(dx, dy)
+
+                            ang_err = wrap_to_pi(desired - heading)
+                            if FLIP_ANGLE_SIGN:
+                                ang_err = -ang_err
+
+                            sock.sendto(struct.pack('<f', float(ang_err)), (UDP_IP, UDP_PORT))
+
+                            last_sent_angle = float(ang_err)
+                            last_sent_time = now
+                            last_udp_sent_time = now
+                else:
+                    cv2.putText(out, "No feasible intercept within MAX_INTERCEPT_T",
+                                (20, 215), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                (0, 0, 255), 2, cv2.LINE_AA)
+
+        else:
+            cv2.putText(out, "R1 predicted ray: speed too low / heading unstable",
+                        (20, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                        (0, 0, 255), 2, cv2.LINE_AA)
+    else:
+        cv2.putText(out, "R1 prediction: waiting for enough samples / stable detection",
+                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+
+    # ============================================================
+    # ANGLE SENT INDICATOR (banner + value)
+    # ============================================================
+    if last_sent_time is not None and (now - last_sent_time) <= ANGLE_SENT_SHOW_S:
+        draw_banner(out, f"ANGLE SENT: {last_sent_angle:+.3f} rad", top_left=(20, 255))
+    else:
+        if tracking_armed and last_sent_angle is not None:
+            cv2.putText(out, f"Streaming: {last_sent_angle:+.3f} rad",
+                        (20, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                        (255, 255, 255), 2, cv2.LINE_AA)
+
+    # HUD
+    loop_end = time.perf_counter()
+    fps = 1.0 / (loop_end - loop_start + 1e-9)
+    cv2.putText(out, f"FPS: {fps:.1f} | 'c' clear | 'q' quit",
+                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                (255, 255, 255), 2, cv2.LINE_AA)
+
+    rej_n = 0 if rejected is None else len(rejected)
+    cv2.putText(out, f"Rejected: {rej_n} | Votes R1:{len(id_votes_r1)} R2:{len(id_votes_r2)}",
+                (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                (255, 255, 255), 2, cv2.LINE_AA)
+
+    # Show key calibration values on screen
+    cv2.putText(out, f"Chaser: {SPHERE_SPEED_M_S:.2f} m/s | PX_PER_M={PX_PER_M:.1f} | v2={CHASER_SPEED_PX_S:.1f} px/s",
+                (20, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (255, 255, 255), 2, cv2.LINE_AA)
+
+    cv2.imshow("frame", out)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    if key == ord('c'):
+        hist1.clear()
+        hist2.clear()
+        trail1.clear()
+        pos1_filt = None
+        pos2_filt = None
+        last_trail1_pt = None
+        id_votes_r1.clear()
+        id_votes_r2.clear()
+        last_seen_r1_t = None
+        last_seen_r2_t = None
+
+        # reset IP state
+        ip_last = None
+        ip_stable_count = 0
+        ip_last_seen_t = None
+        tracking_armed = False
+
+        # reset indicator + udp timing
+        last_sent_angle = None
+        last_sent_time = None
+        last_udp_sent_time = None
+
+cap.release()
+cv2.destroyAllWindows()
+exit(0)

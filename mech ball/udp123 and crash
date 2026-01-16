@@ -1,0 +1,763 @@
+"""
+MERGED SCRIPT: Critical-state trigger + Trajectory/Intercept + Crash-detection + 'S' key start UI
++ BIG OBVIOUS CRASH INDICATOR (fullscreen flashing + huge text)
+
+Change summary vs your version:
+- Added CRASH_FLASH_S / CRASH_FLASH_HZ config
+- Added last_crash_event_t global
+- Modified send_crash_pulse() to set last_crash_event_t
+- Replaced the small "CRASH PULSE SENT" HUD with a big flashing overlay + huge CRASH text
+"""
+
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+import socket
+import struct
+import time
+import math
+from collections import deque, Counter
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+# Camera
+CAM_INDEX = 1
+FRAME_W = 1920
+FRAME_H = 1080
+
+# ArUco
+ARUCO_DICT = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+ARUCO_PARAMS = aruco.DetectorParameters()
+
+# IDs
+CRITICAL_ID = 1              # critical marker to unlock everything
+ROBOT1_ID = 1                # target marker
+ROBOT2_ID = 2                # chaser marker
+
+# Preprocess robustness
+USE_CLAHE = True
+USE_BILATERAL = True
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if USE_CLAHE else None
+
+# Tracking smoothing / stability
+MAX_HISTORY = 30
+ALPHA_POS = 0.35
+MIN_STEP_PX = 2
+
+ID_VOTE_WINDOW = 7
+ID_MIN_VOTES = 4
+GATE_DIST_PX = 25
+LOST_TIMEOUT_S = 0.35
+
+# Robot1 prediction drawing
+PATH_LEN_PX = 800
+MIN_SPEED_PX_S = 15.0
+
+# Camera control (optional)
+TRY_DISABLE_AUTO_EXPOSURE = True
+MANUAL_EXPOSURE = -6
+MANUAL_GAIN = 0
+
+# ============================================================
+# UDP TARGETS
+# ============================================================
+
+UDP_IP = "138.38.229.153"
+
+# Critical pulse output (1 byte 0x01 for 1 second)
+UDP_PORT_CRITICAL = 671
+TRIGGER_BYTE = b"\x01"
+PULSE_DURATION_S = 1.0
+REARM_TIMEOUT_S = 5.0
+CRITICAL_SEND_RATE_HZ = 30.0
+
+# Angle output (float32 radians)
+UDP_PORT_ANGLE = 672
+SEND_RATE_HZ_ANGLE = 50.0  # rate limit for angle stream
+FLIP_ANGLE_SIGN = False
+HEADING_OFFSET_RAD = 0.0
+
+# Crash pulse output (uint8=1 pulse)
+UDP_PORT_CRASH = 673
+CRASH_RADIUS_PX = 80       # tune
+HYST_PX = 8
+MIN_PULSE_PERIOD_S = 0.25
+
+# --- BIG CRASH INDICATOR ---
+CRASH_FLASH_S = 1.2         # how long to show big warning after pulse
+CRASH_FLASH_HZ = 6.0        # flashing frequency
+
+# ============================================================
+# CHASER SPEED (must be px/s)
+# ============================================================
+SPHERE_SPEED_M_S = 1.66
+PX_PER_M = 100.0  # <-- CALIBRATE
+CHASER_SPEED_PX_S = SPHERE_SPEED_M_S * PX_PER_M
+MAX_INTERCEPT_T = 3.0
+
+# IP stability (arm-then-stream)
+IP_STABLE_PX = 6.0
+IP_STABLE_FRAMES = 10
+IP_LOST_RESET_S = 0.30
+
+# HUD
+ANGLE_SENT_SHOW_S = 2.0
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def preprocess_gray(frame_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    if USE_CLAHE and clahe is not None:
+        gray = clahe.apply(gray)
+    if USE_BILATERAL:
+        gray = cv2.bilateralFilter(gray, 5, 50, 50)
+    return gray
+
+def centroid_from_corners(corners_4x2: np.ndarray) -> np.ndarray:
+    return np.mean(corners_4x2, axis=0)
+
+def dist2(a, b):
+    dx = float(a[0] - b[0])
+    dy = float(a[1] - b[1])
+    return dx * dx + dy * dy
+
+def majority_vote(id_deque):
+    if not id_deque:
+        return None, 0
+    c = Counter(id_deque)
+    winner, votes = c.most_common(1)[0]
+    return int(winner), int(votes)
+
+def estimate_velocity(history_deque):
+    """Least-squares fit x(t), y(t) -> velocity (vx,vy) in px/s."""
+    if len(history_deque) < 6:
+        return None
+    t = np.array([h[0] for h in history_deque], dtype=np.float64)
+    p = np.array([h[1] for h in history_deque], dtype=np.float64)  # (N,2)
+    t0 = t[0]
+    tt = t - t0
+    A = np.vstack([tt, np.ones_like(tt)]).T
+    vx, _bx = np.linalg.lstsq(A, p[:, 0], rcond=None)[0]
+    vy, _by = np.linalg.lstsq(A, p[:, 1], rcond=None)[0]
+    return np.array([float(vx), float(vy)], dtype=np.float64)
+
+def wrap_to_pi(a: float) -> float:
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+def angle_from_vec(vx: float, vy: float) -> float:
+    """Angle of vector in image coords (x right, y down)."""
+    return math.atan2(vy, vx)
+
+def draw_x(img, pt, size=12, color=(255, 0, 255), thickness=3):
+    x, y = pt
+    cv2.line(img, (x - size, y - size), (x + size, y + size), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x - size, y + size), (x + size, y - size), color, thickness, cv2.LINE_AA)
+
+def draw_banner(out_img, text, top_left=(20, 260), pad=10,
+                bg_color=(0, 200, 0), text_color=(255, 255, 255)):
+    x, y = top_left
+    (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2)
+    w = tw + 2 * pad
+    h = th + baseline + 2 * pad
+    cv2.rectangle(out_img, (x, y), (x + w, y + h), bg_color, -1)
+    cv2.putText(out_img, text, (x + pad, y + pad + th),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85, text_color, 2, cv2.LINE_AA)
+
+def compute_intercept_point(p1, v1, p2, chaser_speed, t_max=5.0):
+    r = (p1 - p2).astype(np.float64)
+    v = v1.astype(np.float64)
+    s = float(chaser_speed)
+
+    a = float(np.dot(v, v) - s * s)
+    b = float(2.0 * np.dot(r, v))
+    c = float(np.dot(r, r))
+
+    if abs(a) < 1e-9:
+        if abs(b) < 1e-9:
+            return None, None
+        t = -c / b
+        if t > 0.0:
+            t = min(t, t_max)
+            return (p1 + v1 * t).astype(np.float64), float(t)
+        return None, None
+
+    disc = b * b - 4.0 * a * c
+    if disc < 0.0:
+        return None, None
+
+    sqrt_disc = math.sqrt(disc)
+    t1 = (-b - sqrt_disc) / (2.0 * a)
+    t2 = (-b + sqrt_disc) / (2.0 * a)
+
+    candidates = [t for t in (t1, t2) if t > 0.0]
+    if not candidates:
+        return None, None
+
+    t = min(candidates)
+    if t > t_max:
+        return None, None
+
+    ip = (p1 + v1 * t).astype(np.float64)
+    return ip, float(t)
+
+# ============================================================
+# UDP SOCKETS
+# ============================================================
+
+sock_critical = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock_angle = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock_crash = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+critical_send_interval = 1.0 / max(1.0, CRITICAL_SEND_RATE_HZ)
+angle_send_min_dt = 1.0 / max(1.0, SEND_RATE_HZ_ANGLE)
+
+# ============================================================
+# CAMERA INIT
+# ============================================================
+
+cap = cv2.VideoCapture(CAM_INDEX)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+
+if TRY_DISABLE_AUTO_EXPOSURE:
+    try:
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        cap.set(cv2.CAP_PROP_EXPOSURE, float(MANUAL_EXPOSURE))
+        cap.set(cv2.CAP_PROP_GAIN, float(MANUAL_GAIN))
+    except Exception:
+        pass
+
+cv2.namedWindow("frame", cv2.WINDOW_AUTOSIZE)
+
+# ============================================================
+# STATE: START UI + CRITICAL TRIGGER
+# ============================================================
+
+started = False
+
+armed = True
+pulse_active = False
+pulse_start_time = None
+last_seen_critical_t = None
+last_critical_send_t = 0.0
+
+unlocked = False  # latched after critical event
+
+# ============================================================
+# STATE: TRACKING / TRAJECTORY / CRASH
+# ============================================================
+
+hist1 = deque(maxlen=MAX_HISTORY)  # (t, [x,y])
+hist2 = deque(maxlen=MAX_HISTORY)
+
+trail1 = deque(maxlen=400)
+pos1_filt = None
+pos2_filt = None
+last_trail1_pt = None
+
+id_votes_r1 = deque(maxlen=ID_VOTE_WINDOW)
+id_votes_r2 = deque(maxlen=ID_VOTE_WINDOW)
+
+last_seen_r1_t = None
+last_seen_r2_t = None
+
+ip_last = None
+ip_stable_count = 0
+ip_last_seen_t = None
+tracking_armed = False
+
+last_sent_angle = None
+last_sent_time = None
+last_udp_sent_time = None
+
+# Crash state
+last_crash_pulse_t = 0.0
+crash_latched = False
+last_crash_pulse_sent_t = None
+
+# --- NEW: crash event time for big overlay ---
+last_crash_event_t = None
+
+def clear_tracking_only():
+    global hist1, hist2, trail1, pos1_filt, pos2_filt, last_trail1_pt
+    global id_votes_r1, id_votes_r2, last_seen_r1_t, last_seen_r2_t
+    global ip_last, ip_stable_count, ip_last_seen_t, tracking_armed
+    global last_sent_angle, last_sent_time, last_udp_sent_time
+    global last_crash_pulse_t, crash_latched, last_crash_pulse_sent_t, last_crash_event_t
+
+    hist1.clear()
+    hist2.clear()
+    trail1.clear()
+    pos1_filt = None
+    pos2_filt = None
+    last_trail1_pt = None
+    id_votes_r1.clear()
+    id_votes_r2.clear()
+    last_seen_r1_t = None
+    last_seen_r2_t = None
+
+    ip_last = None
+    ip_stable_count = 0
+    ip_last_seen_t = None
+    tracking_armed = False
+
+    last_sent_angle = None
+    last_sent_time = None
+    last_udp_sent_time = None
+
+    last_crash_pulse_t = 0.0
+    crash_latched = False
+    last_crash_pulse_sent_t = None
+    last_crash_event_t = None
+
+def full_reset():
+    global started, armed, pulse_active, pulse_start_time, last_seen_critical_t, last_critical_send_t, unlocked
+    started = False
+    armed = True
+    pulse_active = False
+    pulse_start_time = None
+    last_seen_critical_t = None
+    last_critical_send_t = 0.0
+    unlocked = False
+    clear_tracking_only()
+
+def send_crash_pulse(now_s: float):
+    # --- MODIFIED: also sets last_crash_event_t ---
+    global last_crash_pulse_t, last_crash_pulse_sent_t, last_crash_event_t
+    payload = struct.pack("B", 1)
+    sock_crash.sendto(payload, (UDP_IP, UDP_PORT_CRASH))
+    last_crash_pulse_t = now_s
+    last_crash_pulse_sent_t = now_s
+    last_crash_event_t = now_s
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+print("Ready. Press 's' to START. Press 'q' to quit.")
+print(f"Critical pulse -> {UDP_IP}:{UDP_PORT_CRITICAL} (byte 0x01, {PULSE_DURATION_S}s)")
+print(f"Angle stream   -> {UDP_IP}:{UDP_PORT_ANGLE} (float32 rad)")
+print(f"Crash pulse    -> {UDP_IP}:{UDP_PORT_CRASH} (uint8=1 when within {CRASH_RADIUS_PX}px)")
+
+while True:
+    loop_start = time.perf_counter()
+
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        print("Failed to grab frame.")
+        break
+
+    now = time.perf_counter()
+    now_s = time.time()
+
+    gray = preprocess_gray(frame)
+    corners, ids, rejected = aruco.detectMarkers(gray, ARUCO_DICT, parameters=ARUCO_PARAMS)
+
+    out = frame.copy()
+
+    # --- draw markers if any ---
+    ids_flat = None
+    if ids is not None and len(ids) > 0:
+        ids_flat = ids.flatten().astype(int)
+        aruco.drawDetectedMarkers(out, corners, ids)
+
+    # ============================================================
+    # START GATE UI
+    # ============================================================
+    if not started:
+        draw_banner(out, "PRESS 'S' TO START", top_left=(20, 20), bg_color=(0, 0, 200))
+        cv2.putText(out, "q: quit | s: start | r: reset",
+                    (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+
+        cv2.imshow("frame", out)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        if key == ord('s'):
+            started = True
+        if key == ord('r'):
+            full_reset()
+        continue
+
+    # ============================================================
+    # CRITICAL WATCH (always active once started)
+    # ============================================================
+    critical_seen = False
+    if ids_flat is not None:
+        critical_seen = (CRITICAL_ID in ids_flat)
+
+    if critical_seen:
+        last_seen_critical_t = now
+
+        # ENTRY -> start pulse + unlock
+        if armed and not pulse_active:
+            pulse_active = True
+            pulse_start_time = now
+            last_critical_send_t = 0.0
+            armed = False
+            unlocked = True
+            print("CRITICAL ENTRY detected -> starting 1s UDP pulse + UNLOCKED trajectory/crash")
+
+    # Send during pulse window
+    if pulse_active:
+        if (now - pulse_start_time) <= PULSE_DURATION_S:
+            if (now - last_critical_send_t) >= critical_send_interval:
+                sock_critical.sendto(TRIGGER_BYTE, (UDP_IP, UDP_PORT_CRITICAL))
+                last_critical_send_t = now
+        else:
+            pulse_active = False
+            print("Critical pulse finished")
+
+    # Re-arm after absence
+    if (not critical_seen) and (not armed):
+        if last_seen_critical_t is not None and (now - last_seen_critical_t) >= REARM_TIMEOUT_S:
+            armed = True
+            print("Critical trigger re-armed after absence")
+
+    # HUD for critical state
+    if pulse_active:
+        cv2.putText(out, "CRITICAL UDP PULSE ACTIVE", (20, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3, cv2.LINE_AA)
+
+    cv2.putText(out, f"UNLOCKED: {unlocked}", (20, 90),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # ============================================================
+    # IF NOT UNLOCKED: skip trajectory + crash detection
+    # ============================================================
+    if not unlocked:
+        cv2.putText(out, "Waiting for CRITICAL state to unlock tracking...", (20, 130),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2, cv2.LINE_AA)
+
+        cv2.imshow("frame", out)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        if key == ord('c'):
+            clear_tracking_only()
+        if key == ord('r'):
+            full_reset()
+        continue
+
+    # ============================================================
+    # UNLOCKED: TRAJECTORY + ANGLE STREAM + CRASH DETECTION
+    # ============================================================
+
+    seen1 = False
+    seen2 = False
+    p1 = None
+    p2 = None
+    r2_corners = None
+
+    detections = []
+    if ids_flat is not None:
+        for i, mid in enumerate(ids_flat):
+            c = corners[i][0]
+            pt = centroid_from_corners(c)
+            detections.append((int(mid), pt, i))
+
+        for mid, pt, i in detections:
+            if mid == ROBOT1_ID:
+                id_votes_r1.append(mid)
+            if mid == ROBOT2_ID:
+                id_votes_r2.append(mid)
+
+        r1_id, r1_votes = majority_vote(id_votes_r1)
+        r2_id, r2_votes = majority_vote(id_votes_r2)
+
+        r1_allowed = (r1_id == ROBOT1_ID and r1_votes >= ID_MIN_VOTES)
+        r2_allowed = (r2_id == ROBOT2_ID and r2_votes >= ID_MIN_VOTES)
+
+        def pick_robot_detection(expected_id, last_pos_filt, allowed):
+            if not detections:
+                return None
+            candidates = [(mid, pt, i) for (mid, pt, i) in detections if mid == expected_id]
+            if allowed and candidates:
+                if last_pos_filt is None:
+                    return candidates[0]
+                candidates.sort(key=lambda x: dist2(x[1], last_pos_filt))
+                return candidates[0]
+
+            if last_pos_filt is not None:
+                close = [(mid, pt, i) for (mid, pt, i) in detections
+                         if dist2(pt, last_pos_filt) <= GATE_DIST_PX * GATE_DIST_PX]
+                if close:
+                    close.sort(key=lambda x: dist2(x[1], last_pos_filt))
+                    return close[0]
+            return None
+
+        pick1 = pick_robot_detection(ROBOT1_ID, pos1_filt, r1_allowed)
+        pick2 = pick_robot_detection(ROBOT2_ID, pos2_filt, r2_allowed)
+
+        if pick1 is not None:
+            mid, pt, idx = pick1
+            seen1 = True
+            last_seen_r1_t = now
+
+            if pos1_filt is None:
+                pos1_filt = pt.copy()
+            else:
+                pos1_filt = (1.0 - ALPHA_POS) * pos1_filt + ALPHA_POS * pt
+
+            p1 = pos1_filt
+            hist1.append((now, p1.copy()))
+
+            p1_int = (int(p1[0]), int(p1[1]))
+            if last_trail1_pt is None:
+                trail1.append(p1_int)
+                last_trail1_pt = p1_int
+            else:
+                ddx = p1_int[0] - last_trail1_pt[0]
+                ddy = p1_int[1] - last_trail1_pt[1]
+                if ddx * ddx + ddy * ddy >= MIN_STEP_PX * MIN_STEP_PX:
+                    trail1.append(p1_int)
+                    last_trail1_pt = p1_int
+
+            cv2.circle(out, p1_int, 6, (0, 255, 0), -1)
+            cv2.putText(out, f"R1 ID:{ROBOT1_ID}", (p1_int[0] + 10, p1_int[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+
+        if pick2 is not None:
+            mid, pt, idx = pick2
+            seen2 = True
+            last_seen_r2_t = now
+            r2_corners = corners[idx][0]
+
+            if pos2_filt is None:
+                pos2_filt = pt.copy()
+            else:
+                pos2_filt = (1.0 - ALPHA_POS) * pos2_filt + ALPHA_POS * pt
+
+            p2 = pos2_filt
+            hist2.append((now, p2.copy()))
+
+            p2_int = (int(p2[0]), int(p2[1]))
+            cv2.circle(out, p2_int, 6, (255, 255, 0), -1)
+            cv2.putText(out, f"R2 ID:{ROBOT2_ID}", (p2_int[0] + 10, p2_int[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2, cv2.LINE_AA)
+
+    if not seen1 and last_seen_r1_t is not None and (now - last_seen_r1_t) <= LOST_TIMEOUT_S:
+        p1 = pos1_filt
+        seen1 = p1 is not None
+    if not seen2 and last_seen_r2_t is not None and (now - last_seen_r2_t) <= LOST_TIMEOUT_S:
+        p2 = pos2_filt
+        seen2 = p2 is not None
+
+    if len(trail1) >= 2:
+        pts = np.array(trail1, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(out, [pts], False, (0, 255, 255), 2)
+
+    # ============================================================
+    # CRASH DETECTION (unlocked) + BIG OBVIOUS INDICATOR
+    # ============================================================
+    if (p1 is not None) and (p2 is not None):
+        dx = float(p2[0] - p1[0])
+        dy = float(p2[1] - p1[1])
+        d = math.hypot(dx, dy)
+
+        cv2.circle(out, (int(p1[0]), int(p1[1])), int(CRASH_RADIUS_PX), (0, 200, 200), 2)
+        cv2.putText(out, f"Dist R2->R1: {d:.1f}px (crash latch={crash_latched})",
+                    (20, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+
+        if (not crash_latched) and (d <= CRASH_RADIUS_PX):
+            if (now_s - last_crash_pulse_t) >= MIN_PULSE_PERIOD_S:
+                send_crash_pulse(now_s)
+            crash_latched = True
+
+        elif crash_latched and (d >= (CRASH_RADIUS_PX + HYST_PX)):
+            crash_latched = False
+
+    else:
+        cv2.putText(out, "Crash: need both R1 and R2",
+                    (20, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                    (0, 0, 255), 2, cv2.LINE_AA)
+
+    # --- BIG FLASHING OVERLAY AFTER CRASH PULSE ---
+    crash_flash_active = (last_crash_event_t is not None) and ((now_s - last_crash_event_t) <= CRASH_FLASH_S)
+    if crash_flash_active:
+        phase = math.sin(2.0 * math.pi * CRASH_FLASH_HZ * (now_s - last_crash_event_t))
+        flash_on = (phase > 0.0)
+
+        if flash_on:
+            overlay = out.copy()
+            cv2.rectangle(overlay, (0, 0), (FRAME_W, FRAME_H), (0, 0, 255), -1)
+            out = cv2.addWeighted(overlay, 0.45, out, 0.55, 0)
+
+            msg = "CRASH!"
+            scale = 5.0
+            thick = 12
+            (tw, th), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+            cx = (FRAME_W - tw) // 2
+            cy = (FRAME_H + th) // 2
+
+            cv2.putText(out, msg, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thick + 8, cv2.LINE_AA)
+            cv2.putText(out, msg, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), thick, cv2.LINE_AA)
+
+            msg2 = "CRASH DETECTED - UDP PULSE SENT"
+            scale2 = 1.6
+            thick2 = 5
+            (tw2, th2), _ = cv2.getTextSize(msg2, cv2.FONT_HERSHEY_SIMPLEX, scale2, thick2)
+            cx2 = (FRAME_W - tw2) // 2
+            cy2 = cy + th + 40
+            cv2.putText(out, msg2, (cx2, cy2), cv2.FONT_HERSHEY_SIMPLEX, scale2, (0, 0, 0), thick2 + 4, cv2.LINE_AA)
+            cv2.putText(out, msg2, (cx2, cy2), cv2.FONT_HERSHEY_SIMPLEX, scale2, (255, 255, 255), thick2, cv2.LINE_AA)
+
+            if (pos1_filt is not None) and (pos2_filt is not None):
+                p1i = (int(pos1_filt[0]), int(pos1_filt[1]))
+                p2i = (int(pos2_filt[0]), int(pos2_filt[1]))
+                cv2.line(out, p1i, p2i, (255, 255, 255), 10, cv2.LINE_AA)
+                cv2.circle(out, p1i, CRASH_RADIUS_PX, (255, 255, 255), 6, cv2.LINE_AA)
+                cv2.circle(out, p1i, 18, (255, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(out, p2i, 18, (255, 255, 255), -1, cv2.LINE_AA)
+    else:
+        # Optional: while inside zone (latched), show a persistent small warning
+        if crash_latched:
+            draw_banner(out, "IN CRASH ZONE", top_left=(20, 195), bg_color=(0, 0, 200))
+
+    # ============================================================
+    # TRAJECTORY / INTERCEPT / ANGLE STREAM (unlocked)
+    # ============================================================
+    if ip_last_seen_t is not None and (now - ip_last_seen_t) > IP_LOST_RESET_S:
+        ip_stable_count = 0
+        ip_last = None
+        ip_last_seen_t = None
+        tracking_armed = False
+
+    v1 = estimate_velocity(hist1)
+    if seen1 and (p1 is not None) and (v1 is not None):
+        speed1 = float(np.linalg.norm(v1))
+        cv2.putText(out, f"R1 v(px/s)=({v1[0]:.1f},{v1[1]:.1f}) | |v|={speed1:.1f}",
+                    (20, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+
+        if speed1 >= MIN_SPEED_PX_S:
+            A = p1.astype(np.float64)
+            u = (v1 / (speed1 + 1e-12)).astype(np.float64)
+            B = (A + u * float(PATH_LEN_PX)).astype(np.float64)
+
+            cv2.line(out, (int(A[0]), int(A[1])), (int(B[0]), int(B[1])),
+                     (255, 0, 255), 3, cv2.LINE_AA)
+
+            if seen2 and (p2 is not None):
+                P = p2.astype(np.float64)
+
+                IP, t_hit = compute_intercept_point(
+                    p1=A, v1=v1, p2=P,
+                    chaser_speed=CHASER_SPEED_PX_S,
+                    t_max=MAX_INTERCEPT_T
+                )
+
+                if IP is not None:
+                    IP_int = (int(IP[0]), int(IP[1]))
+                    P_int = (int(P[0]), int(P[1]))
+
+                    cv2.line(out, P_int, IP_int, (255, 0, 255), 2, cv2.LINE_AA)
+                    draw_x(out, IP_int, size=14, color=(255, 0, 255), thickness=3)
+                    cv2.putText(out, f"IP (t={t_hit:.2f}s)", (IP_int[0] + 10, IP_int[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 0, 255), 2, cv2.LINE_AA)
+
+                    ip_last_seen_t = now
+                    if ip_last is None:
+                        ip_last = IP.copy()
+                        ip_stable_count = 0
+                    else:
+                        step = float(np.linalg.norm(IP - ip_last))
+                        if step <= IP_STABLE_PX:
+                            ip_stable_count += 1
+                        else:
+                            ip_stable_count = 0
+                        ip_last = IP.copy()
+
+                    ip_is_stable = (ip_stable_count >= IP_STABLE_FRAMES)
+                    if (not tracking_armed) and ip_is_stable:
+                        tracking_armed = True
+
+                    cv2.putText(out,
+                                f"IP stable: {ip_is_stable} ({ip_stable_count}/{IP_STABLE_FRAMES}) | armed:{tracking_armed}",
+                                (20, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                                (255, 255, 255), 2, cv2.LINE_AA)
+
+                    if tracking_armed and (r2_corners is not None):
+                        can_send = True
+                        if last_udp_sent_time is not None:
+                            can_send = (now - last_udp_sent_time) >= angle_send_min_dt
+
+                        if can_send:
+                            c0 = r2_corners[0]  # TL
+                            c1 = r2_corners[1]  # TR
+                            hx = float(c1[0] - c0[0])
+                            hy = float(c1[1] - c0[1])
+
+                            heading = wrap_to_pi(angle_from_vec(hx, hy) + HEADING_OFFSET_RAD)
+
+                            ddx = float(IP[0] - P[0])
+                            ddy = float(IP[1] - P[1])
+                            desired = angle_from_vec(ddx, ddy)
+
+                            ang_err = wrap_to_pi(desired - heading)
+                            if FLIP_ANGLE_SIGN:
+                                ang_err = -ang_err
+
+                            sock_angle.sendto(struct.pack("<f", float(ang_err)), (UDP_IP, UDP_PORT_ANGLE))
+                            last_udp_sent_time = now
+
+                            last_sent_angle = float(ang_err)
+                            last_sent_time = now
+                else:
+                    cv2.putText(out, "No feasible intercept within MAX_INTERCEPT_T",
+                                (20, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                                (0, 0, 255), 2, cv2.LINE_AA)
+        else:
+            cv2.putText(out, "R1 predicted ray: speed too low / heading unstable",
+                        (20, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                        (0, 0, 255), 2, cv2.LINE_AA)
+    else:
+        cv2.putText(out, "R1 prediction: waiting for enough samples / stable detection",
+                    (20, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+
+    if last_sent_time is not None and (now - last_sent_time) <= ANGLE_SENT_SHOW_S:
+        draw_banner(out, f"ANGLE SENT: {last_sent_angle:+.3f} rad", top_left=(20, 275))
+    else:
+        if tracking_armed and last_sent_angle is not None:
+            cv2.putText(out, f"Streaming: {last_sent_angle:+.3f} rad",
+                        (20, 305), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (255, 255, 255), 2, cv2.LINE_AA)
+
+    # ============================================================
+    # GLOBAL HUD + KEYS
+    # ============================================================
+    loop_end = time.perf_counter()
+    fps = 1.0 / (loop_end - loop_start + 1e-9)
+
+    rej_n = 0 if rejected is None else len(rejected)
+    cv2.putText(out, f"FPS: {fps:.1f} | q quit | c clear | r reset",
+                (20, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, f"Rejected: {rej_n} | Votes R1:{len(id_votes_r1)} R2:{len(id_votes_r2)}",
+                (20, 370), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, f"Chaser: {SPHERE_SPEED_M_S:.2f} m/s | PX_PER_M={PX_PER_M:.1f} | v2={CHASER_SPEED_PX_S:.1f} px/s",
+                (20, 400), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                (255, 255, 255), 2, cv2.LINE_AA)
+
+    cv2.imshow("frame", out)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord("q"):
+        break
+    if key == ord("c"):
+        clear_tracking_only()
+    if key == ord("r"):
+        full_reset()
+
+cap.release()
+cv2.destroyAllWindows()
+sock_critical.close()
+sock_angle.close()
+sock_crash.close()

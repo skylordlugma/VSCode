@@ -1,0 +1,518 @@
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+import socket
+import time
+from collections import deque, Counter
+import struct
+import math
+
+# ============================================================
+# SHARED / GLOBAL CONFIG
+# ============================================================
+CAM_INDEX = 1
+
+# ArUco
+ARUCO_DICT = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+ARUCO_PARAMS = aruco.DetectorParameters()
+
+USE_CLAHE = True
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if USE_CLAHE else None
+
+def preprocess_gray_basic(frame_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    if USE_CLAHE and clahe is not None:
+        gray = clahe.apply(gray)
+    return gray
+
+
+# ============================================================
+# STATE 1: WATCH (critical entry pulse sender)
+# ============================================================
+CRITICAL_ID = 1
+WATCH_UDP_IP = "138.38.229.153"
+WATCH_UDP_PORT = 5005
+TRIGGER_BYTE = b'\x01'
+
+PULSE_DURATION_S = 1.0
+REARM_TIMEOUT_S = 5.0
+SEND_RATE_HZ = 30
+SEND_INTERVAL = 1.0 / SEND_RATE_HZ
+
+
+# ============================================================
+# STATE 2: INTERCEPT (your second code) CONFIG
+# ============================================================
+ROBOT1_ID = 1
+ROBOT2_ID = 2
+
+MAX_HISTORY = 30
+ALPHA_POS = 0.35
+MIN_STEP_PX = 2
+
+PATH_LEN_PX = 800
+MIN_SPEED_PX_S = 15.0
+
+USE_BILATERAL = True
+ID_VOTE_WINDOW = 7
+ID_MIN_VOTES = 4
+GATE_DIST_PX = 25
+LOST_TIMEOUT_S = 0.35
+
+TRY_DISABLE_AUTO_EXPOSURE = True
+MANUAL_EXPOSURE = -6
+MANUAL_GAIN = 0
+
+INTERCEPT_UDP_IP = "138.38.229.153"
+INTERCEPT_UDP_PORT = 50002
+
+FLIP_ANGLE_SIGN = False
+HEADING_OFFSET_RAD = 0.0
+
+IP_STABLE_PX = 6.0
+IP_STABLE_FRAMES = 10
+IP_RESET_JUMP_PX = 40.0
+IP_LOST_RESET_S = 0.30
+
+ANGLE_SENT_SHOW_S = 2.0
+
+
+# ----------------------------
+# INTERCEPT helpers (copied from your code)
+# ----------------------------
+def preprocess_gray_intercept(frame_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    if USE_CLAHE and clahe is not None:
+        gray = clahe.apply(gray)
+    if USE_BILATERAL:
+        gray = cv2.bilateralFilter(gray, 5, 50, 50)
+    return gray
+
+def centroid_from_corners(corners_4x2: np.ndarray) -> np.ndarray:
+    return np.mean(corners_4x2, axis=0)
+
+def estimate_velocity(history_deque):
+    if len(history_deque) < 6:
+        return None
+    t = np.array([h[0] for h in history_deque], dtype=np.float64)
+    p = np.array([h[1] for h in history_deque], dtype=np.float64)
+    t0 = t[0]
+    tt = t - t0
+    A = np.vstack([tt, np.ones_like(tt)]).T
+    vx, _bx = np.linalg.lstsq(A, p[:, 0], rcond=None)[0]
+    vy, _by = np.linalg.lstsq(A, p[:, 1], rcond=None)[0]
+    return np.array([float(vx), float(vy)], dtype=np.float64)
+
+def draw_x(img, pt, size=12, color=(255, 0, 255), thickness=3):
+    x, y = pt
+    cv2.line(img, (x - size, y - size), (x + size, y + size), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x - size, y + size), (x + size, y - size), color, thickness, cv2.LINE_AA)
+
+def dist2(a, b):
+    dx = float(a[0] - b[0])
+    dy = float(a[1] - b[1])
+    return dx*dx + dy*dy
+
+def majority_vote(id_deque):
+    if not id_deque:
+        return None, 0
+    c = Counter(id_deque)
+    winner, votes = c.most_common(1)[0]
+    return int(winner), int(votes)
+
+def wrap_to_pi(a: float) -> float:
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+def angle_from_vec(vx: float, vy: float) -> float:
+    return math.atan2(vy, vx)
+
+def draw_banner(out_img, text, top_left=(20, 260), pad=10,
+                bg_color=(0, 200, 0), text_color=(255, 255, 255)):
+    x, y = top_left
+    (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2)
+    w = tw + 2 * pad
+    h = th + baseline + 2 * pad
+    cv2.rectangle(out_img, (x, y), (x + w, y + h), bg_color, -1)
+    cv2.putText(out_img, text, (x + pad, y + pad + th),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85, text_color, 2, cv2.LINE_AA)
+
+
+# ============================================================
+# INTERCEPT loop as a function
+# ============================================================
+def run_intercept(cap):
+    # New socket dedicated to intercept angle packets
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    # Detector tuning (as in your code)
+    params = ARUCO_PARAMS
+    params.adaptiveThreshWinSizeMin = 3
+    params.adaptiveThreshWinSizeMax = 35
+    params.adaptiveThreshWinSizeStep = 4
+    params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+    params.cornerRefinementWinSize = 5
+    params.cornerRefinementMaxIterations = 30
+    params.cornerRefinementMinAccuracy = 0.1
+    params.minMarkerPerimeterRate = 0.03
+    params.maxMarkerPerimeterRate = 4.0
+    params.perspectiveRemoveIgnoredMarginPerCell = 0.2
+    params.perspectiveRemovePixelPerCell = 8
+
+    # Attempt to set exposure/gain once (camera backend-dependent)
+    if TRY_DISABLE_AUTO_EXPOSURE:
+        try:
+            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+            cap.set(cv2.CAP_PROP_EXPOSURE, float(MANUAL_EXPOSURE))
+            cap.set(cv2.CAP_PROP_GAIN, float(MANUAL_GAIN))
+        except Exception:
+            pass
+
+    # State buffers
+    hist1 = deque(maxlen=MAX_HISTORY)
+    hist2 = deque(maxlen=MAX_HISTORY)
+    trail1 = deque(maxlen=400)
+    pos1_filt = None
+    pos2_filt = None
+    last_trail1_pt = None
+    id_votes_r1 = deque(maxlen=ID_VOTE_WINDOW)
+    id_votes_r2 = deque(maxlen=ID_VOTE_WINDOW)
+    last_seen_r1_t = None
+    last_seen_r2_t = None
+
+    ip_last = None
+    ip_stable_count = 0
+    ip_last_seen_t = None
+    sent_once = False
+
+    last_sent_angle = None
+    last_sent_time = None
+
+    cv2.namedWindow("frame", cv2.WINDOW_AUTOSIZE)
+
+    while True:
+        loop_start = time.perf_counter()
+
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            print("Failed to grab frame.")
+            break
+
+        now = time.perf_counter()
+        gray = preprocess_gray_intercept(frame)
+
+        corners, ids, rejected = aruco.detectMarkers(gray, ARUCO_DICT, parameters=params)
+
+        out = frame.copy()
+
+        seen1 = False
+        seen2 = False
+        p1 = None
+        p2 = None
+        r2_corners = None
+
+        if ids is not None and len(ids) > 0:
+            ids_flat = ids.flatten().astype(int)
+            aruco.drawDetectedMarkers(out, corners, ids)
+
+            detections = []
+            for i, mid in enumerate(ids_flat):
+                c = corners[i][0]
+                pt = centroid_from_corners(c)
+                detections.append((int(mid), pt, i))
+
+            for mid, pt, i in detections:
+                if mid == ROBOT1_ID:
+                    id_votes_r1.append(mid)
+                if mid == ROBOT2_ID:
+                    id_votes_r2.append(mid)
+
+            r1_id, r1_votes = majority_vote(id_votes_r1)
+            r2_id, r2_votes = majority_vote(id_votes_r2)
+
+            r1_allowed = (r1_id == ROBOT1_ID and r1_votes >= ID_MIN_VOTES)
+            r2_allowed = (r2_id == ROBOT2_ID and r2_votes >= ID_MIN_VOTES)
+
+            def pick_robot_detection(expected_id, last_pos_filt, allowed):
+                if not detections:
+                    return None
+                candidates = [(mid, pt, i) for (mid, pt, i) in detections if mid == expected_id]
+                if allowed and candidates:
+                    if last_pos_filt is None:
+                        return candidates[0]
+                    candidates.sort(key=lambda x: dist2(x[1], last_pos_filt))
+                    return candidates[0]
+                if last_pos_filt is not None:
+                    close = [(mid, pt, i) for (mid, pt, i) in detections
+                             if dist2(pt, last_pos_filt) <= GATE_DIST_PX*GATE_DIST_PX]
+                    if close:
+                        close.sort(key=lambda x: dist2(x[1], last_pos_filt))
+                        return close[0]
+                return None
+
+            pick1 = pick_robot_detection(ROBOT1_ID, pos1_filt, r1_allowed)
+            pick2 = pick_robot_detection(ROBOT2_ID, pos2_filt, r2_allowed)
+
+            if pick1 is not None:
+                mid, pt, idx = pick1
+                seen1 = True
+                last_seen_r1_t = now
+
+                pos1_filt = pt.copy() if pos1_filt is None else (1.0 - ALPHA_POS) * pos1_filt + ALPHA_POS * pt
+                p1 = pos1_filt
+                hist1.append((now, p1.copy()))
+
+                p1_int = (int(p1[0]), int(p1[1]))
+                if last_trail1_pt is None:
+                    trail1.append(p1_int)
+                    last_trail1_pt = p1_int
+                else:
+                    dx = p1_int[0] - last_trail1_pt[0]
+                    dy = p1_int[1] - last_trail1_pt[1]
+                    if dx*dx + dy*dy >= MIN_STEP_PX*MIN_STEP_PX:
+                        trail1.append(p1_int)
+                        last_trail1_pt = p1_int
+
+                cv2.circle(out, p1_int, 6, (0, 255, 0), -1)
+                cv2.putText(out, f"R1 ID:{ROBOT1_ID}", (p1_int[0] + 10, p1_int[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+
+            if pick2 is not None:
+                mid, pt, idx = pick2
+                seen2 = True
+                last_seen_r2_t = now
+                r2_corners = corners[idx][0]
+
+                pos2_filt = pt.copy() if pos2_filt is None else (1.0 - ALPHA_POS) * pos2_filt + ALPHA_POS * pt
+                p2 = pos2_filt
+                hist2.append((now, p2.copy()))
+
+                p2_int = (int(p2[0]), int(p2[1]))
+                cv2.circle(out, p2_int, 6, (255, 255, 0), -1)
+                cv2.putText(out, f"R2 ID:{ROBOT2_ID}", (p2_int[0] + 10, p2_int[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2, cv2.LINE_AA)
+
+        # brief dropouts
+        if not seen1 and last_seen_r1_t is not None and (now - last_seen_r1_t) <= LOST_TIMEOUT_S:
+            p1 = pos1_filt
+            seen1 = p1 is not None
+        if not seen2 and last_seen_r2_t is not None and (now - last_seen_r2_t) <= LOST_TIMEOUT_S:
+            p2 = pos2_filt
+            seen2 = p2 is not None
+
+        # re-arm if IP missing
+        if ip_last_seen_t is not None and (now - ip_last_seen_t) > IP_LOST_RESET_S:
+            ip_stable_count = 0
+            ip_last = None
+            sent_once = False
+            ip_last_seen_t = None
+
+        # trail
+        if len(trail1) >= 2:
+            pts = np.array(trail1, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(out, [pts], False, (0, 255, 255), 2)
+
+        v1 = estimate_velocity(hist1)
+        if seen1 and p1 is not None and v1 is not None:
+            speed = float(np.linalg.norm(v1))
+            cv2.putText(out, f"R1 v(px/s)=({v1[0]:.1f},{v1[1]:.1f}) | |v|={speed:.1f}",
+                        (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                        (255, 255, 255), 2, cv2.LINE_AA)
+
+            if speed >= MIN_SPEED_PX_S:
+                u = (v1 / speed).astype(np.float64)
+                A = p1.astype(np.float64)
+                B = (p1 + u * float(PATH_LEN_PX)).astype(np.float64)
+
+                cv2.line(out, (int(A[0]), int(A[1])), (int(B[0]), int(B[1])), (255, 0, 255), 3, cv2.LINE_AA)
+
+                if seen2 and p2 is not None:
+                    P = p2.astype(np.float64)
+
+                    tproj = float(np.dot(P - A, u))
+                    t_clamped = float(np.clip(tproj, 0.0, float(PATH_LEN_PX)))
+                    F = A + u * t_clamped
+
+                    F_int = (int(F[0]), int(F[1]))
+                    P_int = (int(P[0]), int(P[1]))
+
+                    cv2.line(out, P_int, F_int, (255, 0, 255), 2, cv2.LINE_AA)
+                    draw_x(out, F_int, size=14, color=(255, 0, 255), thickness=3)
+                    cv2.putText(out, "IP", (F_int[0] + 10, F_int[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2, cv2.LINE_AA)
+
+                    # stability
+                    ip_last_seen_t = now
+                    if ip_last is None:
+                        ip_last = F.copy()
+                        ip_stable_count = 0
+                    else:
+                        step = float(np.linalg.norm(F - ip_last))
+                        if step > IP_RESET_JUMP_PX:
+                            ip_stable_count = 0
+                            sent_once = False
+                        else:
+                            ip_stable_count = ip_stable_count + 1 if step <= IP_STABLE_PX else 0
+                        ip_last = F.copy()
+
+                    ip_is_stable = (ip_stable_count >= IP_STABLE_FRAMES)
+                    cv2.putText(out, f"IP stable: {ip_is_stable} ({ip_stable_count}/{IP_STABLE_FRAMES})",
+                                (20, 215), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                (255, 255, 255), 2, cv2.LINE_AA)
+
+                    # send angle ONCE
+                    if (not sent_once) and ip_is_stable and (r2_corners is not None):
+                        c0 = r2_corners[0]  # TL
+                        c1 = r2_corners[1]  # TR
+
+                        hx = float(c1[0] - c0[0])
+                        hy = float(c1[1] - c0[1])
+
+                        heading = angle_from_vec(hx, hy)
+                        heading = wrap_to_pi(heading + HEADING_OFFSET_RAD)
+
+                        dx = float(F[0] - P[0])
+                        dy = float(F[1] - P[1])
+                        desired = angle_from_vec(dx, dy)
+
+                        ang_err = wrap_to_pi(desired - heading)
+                        if FLIP_ANGLE_SIGN:
+                            ang_err = -ang_err
+
+                        sock.sendto(struct.pack('<f', float(ang_err)), (INTERCEPT_UDP_IP, INTERCEPT_UDP_PORT))
+                        sent_once = True
+                        last_sent_angle = float(ang_err)
+                        last_sent_time = now
+            else:
+                cv2.putText(out, "Predicted path: speed too low / heading unstable",
+                            (20, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                            (0, 0, 255), 2, cv2.LINE_AA)
+        else:
+            cv2.putText(out, "R1 prediction: waiting for enough samples / stable detection",
+                        (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                        (255, 255, 255), 2, cv2.LINE_AA)
+
+        # angle sent banner
+        if last_sent_time is not None and (now - last_sent_time) <= ANGLE_SENT_SHOW_S:
+            draw_banner(out, f"ANGLE SENT: {last_sent_angle:+.3f} rad", top_left=(20, 255))
+        else:
+            if sent_once and last_sent_angle is not None:
+                cv2.putText(out, f"Sent once: {last_sent_angle:+.3f} rad",
+                            (20, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                            (255, 255, 255), 2, cv2.LINE_AA)
+
+        # HUD
+        fps = 1.0 / (time.perf_counter() - loop_start + 1e-9)
+        cv2.putText(out, f"FPS: {fps:.1f} | 'c' clear | 'q' quit",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+
+        rej_n = 0 if rejected is None else len(rejected)
+        cv2.putText(out, f"Rejected: {rej_n} | Votes R1:{len(id_votes_r1)} R2:{len(id_votes_r2)}",
+                    (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+
+        cv2.imshow("frame", out)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('q'):
+            break
+
+        if key == ord('c'):
+            hist1.clear(); hist2.clear(); trail1.clear()
+            pos1_filt = None; pos2_filt = None; last_trail1_pt = None
+            id_votes_r1.clear(); id_votes_r2.clear()
+            last_seen_r1_t = None; last_seen_r2_t = None
+            ip_last = None; ip_stable_count = 0; ip_last_seen_t = None; sent_once = False
+            last_sent_angle = None; last_sent_time = None
+
+    sock.close()
+
+
+# ============================================================
+# MAIN: WATCH → INTERCEPT
+# ============================================================
+def main():
+    # camera open once and reuse
+    cap = cv2.VideoCapture(CAM_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+
+    # socket for WATCH pulse
+    watch_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    armed = True
+    pulse_active = False
+    pulse_start_time = None
+    last_seen_time = None
+    last_send_time = 0.0
+
+    state = "WATCH"
+
+    while True:
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            break
+
+        now = time.perf_counter()
+
+        if state == "WATCH":
+            gray = preprocess_gray_basic(frame)
+            corners, ids, _ = aruco.detectMarkers(gray, ARUCO_DICT, parameters=ARUCO_PARAMS)
+
+            critical_seen = False
+            if ids is not None:
+                critical_seen = (CRITICAL_ID in ids.flatten().astype(int))
+                aruco.drawDetectedMarkers(frame, corners, ids)
+
+            # ENTRY -> start pulse
+            if critical_seen:
+                last_seen_time = now
+                if armed and not pulse_active:
+                    pulse_active = True
+                    pulse_start_time = now
+                    last_send_time = 0.0
+                    armed = False
+                    print("ENTRY detected → starting 1 s UDP pulse")
+
+            # SEND during pulse window
+            if pulse_active:
+                if (now - pulse_start_time) <= PULSE_DURATION_S:
+                    if (now - last_send_time) >= SEND_INTERVAL:
+                        watch_sock.sendto(TRIGGER_BYTE, (WATCH_UDP_IP, WATCH_UDP_PORT))
+                        last_send_time = now
+                else:
+                    pulse_active = False
+                    print("Pulse finished → switching to INTERCEPT")
+                    state = "INTERCEPT"
+                    # Important: close the WATCH window before intercept draws its own
+                    cv2.destroyAllWindows()
+                    run_intercept(cap)   # returns when you press 'q' in intercept
+                    print("Intercept ended.")
+                    break  # or: state = "WATCH" to re-arm and keep running
+
+            # RE-ARM after absence
+            if (not critical_seen) and (not armed):
+                if last_seen_time is not None and (now - last_seen_time) >= REARM_TIMEOUT_S:
+                    armed = True
+                    print("Re-armed after absence")
+
+            # UI
+            if pulse_active:
+                cv2.putText(frame, "UDP PULSE ACTIVE", (30, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+
+            cv2.imshow("frame", frame)
+            if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                break
+
+        else:
+            # If you ever add more states, handle them here
+            pass
+
+    cap.release()
+    cv2.destroyAllWindows()
+    watch_sock.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,322 @@
+"""
+Full ArUco tracking (Robot 1 + Robot 2) with crash-detection UDP pulse.
+
+What it does:
+- Detects ArUco markers for ROBOT1_ID and ROBOT2_ID
+- Maintains smoothed positions (EMA) and simple velocity estimate
+- Computes distance between robots each frame
+- When Robot 2 enters CRASH_RADIUS_PX of Robot 1, sends a 1-byte UDP pulse = 1 (debounced + latched)
+- Draws overlays (IDs, trails, radius ring, distance, and "CRASH PULSE SENT" indicator)
+
+Dependencies:
+- opencv-python
+- numpy
+
+Test:
+- Run the script, make sure camera index is correct.
+- In Simulink, UDP Receive on CRASH_UDP_PORT with Data size = 1 (uint8).
+"""
+
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+import time
+from collections import deque, Counter
+import socket
+import struct
+import math
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+# Camera
+CAM_INDEX = 1
+FRAME_W = 1280
+FRAME_H = 720
+
+# ArUco
+ARUCO_DICT = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+ARUCO_PARAMS = aruco.DetectorParameters()
+
+ROBOT1_ID = 1
+ROBOT2_ID = 2
+
+# Smoothing / tracking
+ALPHA_POS = 0.35          # EMA smoothing for position
+MAX_HISTORY = 40          # for trail display + velocity estimate
+MIN_STEP_PX = 2           # ignore very tiny jitter updates
+
+# Robustness (optional)
+USE_CLAHE = True
+USE_BILATERAL = True
+ID_VOTE_WINDOW = 7
+ID_MIN_VOTES = 4
+GATE_DIST_PX = 40         # if a detection is too far from last known, treat as suspect
+
+# Crash detection (pixels)
+CRASH_RADIUS_PX = 80      # tune to your setup
+HYST_PX = 8               # hysteresis to prevent chattering at boundary
+MIN_PULSE_PERIOD_S = 0.25 # debounce: minimum time between crash pulses
+
+# UDP (Crash pulse)
+CRASH_UDP_IP = "138.38.229.153"  # Simulink receiver IP
+CRASH_UDP_PORT = 673            # Simulink UDP Receive port
+# Payload: 1 byte (uint8) value 1 when crash event occurs (pulse)
+# (Optionally you can also send 0 when cleared; currently we send only pulses)
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def ema(prev, new, alpha):
+    if prev is None:
+        return new
+    return (1.0 - alpha) * prev + alpha * new
+
+def hypot2(dx, dy):
+    return float(math.hypot(float(dx), float(dy)))
+
+def preprocess_gray(frame_bgr: np.ndarray, clahe_obj=None) -> np.ndarray:
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    if USE_CLAHE and clahe_obj is not None:
+        gray = clahe_obj.apply(gray)
+    if USE_BILATERAL:
+        gray = cv2.bilateralFilter(gray, d=7, sigmaColor=45, sigmaSpace=45)
+    return gray
+
+def centroid_from_corners(corners_4x2: np.ndarray):
+    # corners_4x2 shape (4,2)
+    c = corners_4x2.mean(axis=0)
+    return float(c[0]), float(c[1])
+
+def draw_text(img, txt, org, scale=0.6, thickness=2):
+    cv2.putText(img, txt, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness+2, cv2.LINE_AA)
+    cv2.putText(img, txt, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+# ============================================================
+# STATE
+# ============================================================
+
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if USE_CLAHE else None
+
+# For each robot: smoothed position, history, last raw, velocity estimate
+r1_pos = None
+r2_pos = None
+
+r1_hist = deque(maxlen=MAX_HISTORY)
+r2_hist = deque(maxlen=MAX_HISTORY)
+
+r1_last_t = None
+r2_last_t = None
+
+r1_vel = np.array([0.0, 0.0], dtype=float)
+r2_vel = np.array([0.0, 0.0], dtype=float)
+
+# ID vote buffers (helps reduce mis-ID flips)
+r1_votes = deque(maxlen=ID_VOTE_WINDOW)
+r2_votes = deque(maxlen=ID_VOTE_WINDOW)
+
+# UDP socket for crash pulses
+sock_crash = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+last_pulse_t = 0.0
+crash_latched = False
+last_crash_pulse_sent_t = None  # for on-screen indicator
+
+def send_crash_pulse():
+    global last_pulse_t, last_crash_pulse_sent_t
+    payload = struct.pack("B", 1)  # 1 byte
+    sock_crash.sendto(payload, (CRASH_UDP_IP, CRASH_UDP_PORT))
+    last_pulse_t = time.time()
+    last_crash_pulse_sent_t = last_pulse_t
+
+def update_crash(robot1_xy, robot2_xy):
+    """
+    Returns: (distance_px or None, crash_pulse_sent_bool)
+    """
+    global crash_latched
+
+    if robot1_xy is None or robot2_xy is None:
+        crash_latched = False
+        return None, False
+
+    dx = robot2_xy[0] - robot1_xy[0]
+    dy = robot2_xy[1] - robot1_xy[1]
+    d = hypot2(dx, dy)
+
+    now = time.time()
+    sent = False
+
+    # Enter crash zone
+    if (not crash_latched) and (d <= CRASH_RADIUS_PX):
+        if (now - last_pulse_t) >= MIN_PULSE_PERIOD_S:
+            send_crash_pulse()
+            sent = True
+        crash_latched = True
+
+    # Exit crash zone with hysteresis
+    elif crash_latched and (d >= (CRASH_RADIUS_PX + HYST_PX)):
+        crash_latched = False
+
+    return d, sent
+
+def gated_update(prev_pos, new_pos, gate_dist_px):
+    """
+    If prev_pos exists and new_pos is far away, treat as suspect and ignore.
+    """
+    if prev_pos is None or new_pos is None:
+        return new_pos
+    dx = new_pos[0] - prev_pos[0]
+    dy = new_pos[1] - prev_pos[1]
+    if hypot2(dx, dy) > gate_dist_px:
+        return None
+    return new_pos
+
+def update_state(prev_pos, prev_t, prev_vel, hist_deque, new_meas_xy):
+    """
+    Applies jitter threshold, EMA, velocity estimate.
+    """
+    now = time.time()
+
+    # If no measurement, do not update
+    if new_meas_xy is None:
+        return prev_pos, prev_t, prev_vel
+
+    new_meas = np.array(new_meas_xy, dtype=float)
+
+    # Jitter ignore
+    if prev_pos is not None:
+        step = hypot2(new_meas[0] - prev_pos[0], new_meas[1] - prev_pos[1])
+        if step < MIN_STEP_PX:
+            # Still push the previous position to history for stable trail if desired
+            if prev_pos is not None:
+                hist_deque.append(np.array(prev_pos, dtype=float))
+            return prev_pos, prev_t, prev_vel
+
+    # EMA smoothing
+    if prev_pos is None:
+        smoothed = new_meas
+    else:
+        smoothed = ema(np.array(prev_pos, dtype=float), new_meas, ALPHA_POS)
+
+    # Velocity estimate
+    if prev_pos is not None and prev_t is not None:
+        dt = max(1e-3, now - prev_t)
+        vel = (smoothed - np.array(prev_pos, dtype=float)) / dt
+        # mild smoothing on velocity
+        prev_vel = 0.65 * prev_vel + 0.35 * vel
+
+    # Update history
+    hist_deque.append(smoothed.copy())
+
+    return (float(smoothed[0]), float(smoothed[1])), now, prev_vel
+
+# ============================================================
+# MAIN
+# ============================================================
+
+cap = cv2.VideoCapture(CAM_INDEX)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+
+if not cap.isOpened():
+    raise RuntimeError(f"Could not open camera index {CAM_INDEX}")
+
+print("Running... Press 'q' to quit.")
+print(f"Crash UDP -> {CRASH_UDP_IP}:{CRASH_UDP_PORT} (1 byte pulses when within {CRASH_RADIUS_PX}px)")
+
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+
+    # Preprocess
+    gray = preprocess_gray(frame, clahe)
+
+    # Detect ArUco
+    corners_list, ids, rejected = aruco.detectMarkers(gray, ARUCO_DICT, parameters=ARUCO_PARAMS)
+
+    # Build detections: id -> centroid
+    detections = {}
+    if ids is not None and len(ids) > 0:
+        for i, mid in enumerate(ids.flatten()):
+            c = corners_list[i].reshape(4, 2)
+            cx, cy = centroid_from_corners(c)
+            detections[int(mid)] = (cx, cy)
+
+    # Determine candidate measurements (raw)
+    r1_meas = detections.get(ROBOT1_ID, None)
+    r2_meas = detections.get(ROBOT2_ID, None)
+
+    # Optional: gate large jumps
+    r1_meas = gated_update(r1_pos, r1_meas, GATE_DIST_PX) if r1_meas is not None else None
+    r2_meas = gated_update(r2_pos, r2_meas, GATE_DIST_PX) if r2_meas is not None else None
+
+    # Update robot states
+    r1_pos, r1_last_t, r1_vel = update_state(r1_pos, r1_last_t, r1_vel, r1_hist, r1_meas)
+    r2_pos, r2_last_t, r2_vel = update_state(r2_pos, r2_last_t, r2_vel, r2_hist, r2_meas)
+
+    # Crash detection update
+    dist_px, crash_pulse_sent = update_crash(r1_pos, r2_pos)
+
+    # ============================================================
+    # DRAW OVERLAY
+    # ============================================================
+
+    # Draw detected markers (raw corners) if any
+    if ids is not None and len(ids) > 0:
+        aruco.drawDetectedMarkers(frame, corners_list, ids)
+
+    # Trails
+    def draw_trail(hist, color):
+        pts = np.array(hist, dtype=np.int32) if len(hist) > 1 else None
+        if pts is not None and pts.shape[0] >= 2:
+            cv2.polylines(frame, [pts], isClosed=False, color=color, thickness=2)
+
+    draw_trail(r1_hist, (0, 255, 255))
+    draw_trail(r2_hist, (255, 0, 255))
+
+    # Robot points + labels
+    if r1_pos is not None:
+        p = (int(r1_pos[0]), int(r1_pos[1]))
+        cv2.circle(frame, p, 6, (0, 255, 255), -1)
+        draw_text(frame, f"R1 ID {ROBOT1_ID}", (p[0] + 10, p[1] - 10))
+
+        # Crash radius ring around R1
+        cv2.circle(frame, p, int(CRASH_RADIUS_PX), (0, 200, 200), 2)
+
+    if r2_pos is not None:
+        p = (int(r2_pos[0]), int(r2_pos[1]))
+        cv2.circle(frame, p, 6, (255, 0, 255), -1)
+        draw_text(frame, f"R2 ID {ROBOT2_ID}", (p[0] + 10, p[1] - 10))
+
+    # Distance + status
+    y0 = 30
+    if dist_px is not None:
+        draw_text(frame, f"Distance R2->R1: {dist_px:.1f}px", (20, y0))
+        y0 += 25
+        draw_text(frame, f"Crash radius: {CRASH_RADIUS_PX}px  (latched={crash_latched})", (20, y0))
+        y0 += 25
+    else:
+        draw_text(frame, "Distance R2->R1: n/a (need both detections)", (20, y0))
+        y0 += 25
+
+    # Crash pulse indicator (shows for 0.6s after sending)
+    if last_crash_pulse_sent_t is not None:
+        if (time.time() - last_crash_pulse_sent_t) <= 0.6:
+            draw_text(frame, "CRASH PULSE SENT (UDP=1 byte)", (20, y0))
+            y0 += 25
+
+    # FPS-ish info
+    draw_text(frame, "Press 'q' to quit", (20, FRAME_H - 20))
+
+    cv2.imshow("ArUco Crash Detection", frame)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+sock_crash.close()
