@@ -29,7 +29,7 @@ FRAME_W = 1280
 FRAME_H = 720
 
 # ArUco
-ARUCO_DICT = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+ARUCO_DICT = aruco.getPredefinedDictionary(aruco.DICT_4X4_1000)
 ARUCO_PARAMS = aruco.DetectorParameters()
 
 # IDs
