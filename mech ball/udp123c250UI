@@ -53,7 +53,7 @@ MIN_SPEED_PX_S = 5.0
 
 # Camera control (optional)
 TRY_DISABLE_AUTO_EXPOSURE = True
-MANUAL_EXPOSURE = -6
+MANUAL_EXPOSURE = -7
 MANUAL_GAIN = 0
 
 # ============================================================

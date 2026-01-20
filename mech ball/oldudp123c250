@@ -59,7 +59,7 @@ MIN_SPEED_PX_S = 5.0
 
 # Camera control (optional)
 TRY_DISABLE_AUTO_EXPOSURE = True
-MANUAL_EXPOSURE = -8
+MANUAL_EXPOSURE = -7
 MANUAL_GAIN = 0
 
 # ============================================================
@@ -88,7 +88,7 @@ ANGLE_ZERO_FRAMES = 1        # consecutive near-zero frames required to latch
 
 # Crash pulse output (uint8=1 pulse)
 UDP_PORT_CRASH = 673
-CRASH_RADIUS_PX = 120       # tune
+CRASH_RADIUS_PX = 170       # tune
 HYST_PX = 8
 MIN_PULSE_PERIOD_S = 0.25
 
@@ -100,13 +100,13 @@ CRASH_FLASH_HZ = 6.0        # flashing frequency
 # CHASER SPEED (must be px/s)
 # ============================================================
 SPHERE_SPEED_M_S = 1.66
-PX_PER_M = 20.0  # <-- CALIBRATE
+PX_PER_M = 50.0  # <-- CALIBRATE
 CHASER_SPEED_PX_S = SPHERE_SPEED_M_S * PX_PER_M
-MAX_INTERCEPT_T = 20.0
+MAX_INTERCEPT_T = 200.0
 
 # IP stability (arm-then-stream)
 IP_STABLE_PX = 6.0
-IP_STABLE_FRAMES = 10
+IP_STABLE_FRAMES = 5
 IP_LOST_RESET_S = 0.30
 
 # HUD
