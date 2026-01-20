@@ -1,0 +1,4 @@
+import cv2
+import cv2.aruco as aruco
+print("OpenCV version:", cv2.__version__)
+print("ArUco available:", hasattr(aruco, 'detectMarkers'))

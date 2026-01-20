@@ -3,10 +3,11 @@ MERGED SCRIPT: Critical-state trigger + Trajectory/Intercept + Crash-detection +
 + BIG OBVIOUS CRASH INDICATOR (fullscreen flashing + huge text)
 + ANGLE ZERO LATCH: when angle reaches ~0, send 0 permanently (until 'c' or 'r')
 
-ADDED (camera calibration integration):
-- Loads Calibration.npz (supports multiple key naming conventions)
-- Optional undistortion of each frame before detection/tracking (USE_UNDISTORT)
-- Optional pose estimation + axis overlay + distance readout (USE_POSE)
+Change summary:
+- Added ANGLE_ZERO_THRESH_RAD / ANGLE_ZERO_FRAMES
+- Added angle_zero_count / angle_zero_latched state
+- Reset these on clear/reset
+- Modified angle send to latch at 0.0 once stable
 """
 
 import cv2
@@ -17,37 +18,6 @@ import struct
 import time
 import math
 from collections import deque, Counter
-
-# ============================================================
-# CAMERA CALIBRATION (load once)
-# ============================================================
-
-# Expecting Calibration.npz in the same folder as this script.
-# Common key variants are handled for robustness.
-cal = np.load("Calibration.npz")
-
-if "CM" in cal and "dist_coef" in cal:
-    CM = cal["CM"]
-    dist_coef = cal["dist_coef"]
-elif "camera_matrix" in cal and "distortion_coefficients" in cal:
-    CM = cal["camera_matrix"]
-    dist_coef = cal["distortion_coefficients"]
-elif "cameraMatrix" in cal and "distCoeffs" in cal:
-    CM = cal["cameraMatrix"]
-    dist_coef = cal["distCoeffs"]
-else:
-    raise KeyError(
-        f"Calibration.npz keys not recognized. Found keys: {list(cal.keys())}. "
-        "Expected ('CM','dist_coef') or similar."
-    )
-
-# Optional: undistort incoming frames before detection/tracking
-USE_UNDISTORT = True
-
-# Optional: enable pose estimation + axes overlay (requires a real marker size)
-USE_POSE = False
-MARKER_SIZE_M = 0.03  # set to your printed marker side length in meters
-AXIS_LEN_M = 0.05     # axis length for drawFrameAxes
 
 # ============================================================
 # CONFIG
@@ -110,20 +80,20 @@ SEND_RATE_HZ_ANGLE = 50.0  # rate limit for angle stream
 FLIP_ANGLE_SIGN = False
 HEADING_OFFSET_RAD = 0.0
 
-# Angle "zero latch" behaviour
+# --- NEW: Angle "zero latch" behaviour ---
 # When |angle| <= threshold for N consecutive sends, latch and send 0.0 forever (until 'c' or 'r')
-ANGLE_ZERO_THRESH_RAD = 0.3
-ANGLE_ZERO_FRAMES = 1
+ANGLE_ZERO_THRESH_RAD = 0.3   # ~1.7 deg; tune
+ANGLE_ZERO_FRAMES = 1        # consecutive near-zero frames required to latch
 
 # Crash pulse output (uint8=1 pulse)
 UDP_PORT_CRASH = 673
-CRASH_RADIUS_PX = 120
+CRASH_RADIUS_PX = 120       # tune
 HYST_PX = 8
 MIN_PULSE_PERIOD_S = 0.25
 
-# BIG CRASH INDICATOR
-CRASH_FLASH_S = 1.2
-CRASH_FLASH_HZ = 6.0
+# --- BIG CRASH INDICATOR ---
+CRASH_FLASH_S = 1.2         # how long to show big warning after pulse
+CRASH_FLASH_HZ = 6.0        # flashing frequency
 
 # ============================================================
 # CHASER SPEED (must be px/s)
@@ -310,7 +280,7 @@ last_sent_angle = None
 last_sent_time = None
 last_udp_sent_time = None
 
-# Angle zero-latch state
+# --- NEW: Angle zero-latch state ---
 angle_zero_count = 0
 angle_zero_latched = False
 
@@ -319,7 +289,7 @@ last_crash_pulse_t = 0.0
 crash_latched = False
 last_crash_pulse_sent_t = None
 
-# crash event time for big overlay
+# --- crash event time for big overlay ---
 last_crash_event_t = None
 
 def clear_tracking_only():
@@ -394,21 +364,11 @@ while True:
         print("Failed to grab frame.")
         break
 
-    # --- APPLY CAMERA CALIBRATION (undistort) ---
-    if USE_UNDISTORT:
-        frame = cv2.undistort(frame, CM, dist_coef, None, CM)
-
     now = time.perf_counter()
     now_s = time.time()
 
     gray = preprocess_gray(frame)
-
     corners, ids, rejected = aruco.detectMarkers(gray, ARUCO_DICT, parameters=ARUCO_PARAMS)
-
-    # Optional pose estimation (for debugging / distance readout)
-    rvecs = tvecs = None
-    if USE_POSE and (ids is not None) and (len(ids) > 0):
-        rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(corners, MARKER_SIZE_M, CM, dist_coef)
 
     out = frame.copy()
 
@@ -417,18 +377,6 @@ while True:
     if ids is not None and len(ids) > 0:
         ids_flat = ids.flatten().astype(int)
         aruco.drawDetectedMarkers(out, corners, ids)
-
-        # Optional pose overlay
-        if USE_POSE and (rvecs is not None) and (tvecs is not None):
-            for k in range(len(ids_flat)):
-                cv2.drawFrameAxes(out, CM, dist_coef, rvecs[k], tvecs[k], AXIS_LEN_M)
-                t = tvecs[k][0]  # meters if MARKER_SIZE_M in meters
-                dist_m = float(np.linalg.norm(t))
-                z_m = float(t[2])
-                c0 = corners[k][0][0].astype(int)
-                cv2.putText(out, f"d={dist_m:.2f}m z={z_m:.2f}m",
-                            (int(c0[0]), int(c0[1]) - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
 
     # ============================================================
     # START GATE UI
@@ -465,7 +413,7 @@ while True:
             last_critical_send_t = 0.0
             armed = False
             unlocked = True
-            print("CRITICAL ENTRY detected -> starting UDP pulse + UNLOCKED trajectory/crash")
+            print("CRITICAL ENTRY detected -> starting 1s UDP pulse + UNLOCKED trajectory/crash")
 
     # Send during pulse window
     if pulse_active:
@@ -617,7 +565,7 @@ while True:
         cv2.polylines(out, [pts], False, (0, 255, 255), 2)
 
     # ============================================================
-    # CRASH DETECTION + BIG OBVIOUS INDICATOR
+    # CRASH DETECTION (unlocked) + BIG OBVIOUS INDICATOR
     # ============================================================
     if (p1 is not None) and (p2 is not None):
         dx = float(p2[0] - p1[0])
@@ -642,7 +590,7 @@ while True:
                     (20, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
                     (0, 0, 255), 2, cv2.LINE_AA)
 
-    # BIG FLASHING OVERLAY AFTER CRASH PULSE
+    # --- BIG FLASHING OVERLAY AFTER CRASH PULSE ---
     crash_flash_active = (last_crash_event_t is not None) and ((now_s - last_crash_event_t) <= CRASH_FLASH_S)
     if crash_flash_active:
         phase = math.sin(2.0 * math.pi * CRASH_FLASH_HZ * (now_s - last_crash_event_t))
@@ -684,7 +632,7 @@ while True:
             draw_banner(out, "IN CRASH ZONE", top_left=(20, 195), bg_color=(0, 0, 200))
 
     # ============================================================
-    # TRAJECTORY / INTERCEPT / ANGLE STREAM
+    # TRAJECTORY / INTERCEPT / ANGLE STREAM (unlocked)
     # ============================================================
     if ip_last_seen_t is not None and (now - ip_last_seen_t) > IP_LOST_RESET_S:
         ip_stable_count = 0
@@ -771,7 +719,7 @@ while True:
                             if FLIP_ANGLE_SIGN:
                                 ang_err = -ang_err
 
-                            # ZERO LATCH
+                            # --- ZERO LATCH: once near-zero is stable, send 0 permanently ---
                             if angle_zero_latched:
                                 ang_to_send = 0.0
                             else:
