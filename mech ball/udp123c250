@@ -29,7 +29,7 @@ FRAME_W = 1280
 FRAME_H = 720
 
 # ArUco
-ARUCO_DICT = aruco.getPredefinedDictionary(aruco.DICT_4X4_1000)
+ARUCO_DICT = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
 ARUCO_PARAMS = aruco.DetectorParameters()
 
 # IDs
@@ -58,7 +58,7 @@ MIN_SPEED_PX_S = 5.0
 
 # Camera control (optional)
 TRY_DISABLE_AUTO_EXPOSURE = True
-MANUAL_EXPOSURE = -5
+MANUAL_EXPOSURE = -7
 MANUAL_GAIN = 0
 
 # ============================================================
