@@ -1,0 +1,945 @@
+import threading
+import queue
+import time
+import math
+import socket
+import struct
+from collections import deque, Counter
+from dataclasses import dataclass
+from datetime import datetime
+import os
+
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+
+import customtkinter as ctk
+from PIL import Image
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+# Camera
+CAM_INDEX = 1  # try 0 if you use laptop webcam
+FRAME_W = 1280
+FRAME_H = 720
+
+# ArUco
+ARUCO_DICT = aruco.getPredefinedDictionary(aruco.DICT_4X4_250)
+ARUCO_PARAMS = aruco.DetectorParameters()
+
+# IDs (theme naming)
+CRITIBOT_ID = 1              # critical marker to unlock everything (Criti-Bot)
+TARGET_ID = 1                # target marker (Criti-Bot body)
+ROBOBALL_ID = 145            # chaser marker (Robo-Ball)
+
+# Preprocess robustness
+USE_CLAHE = True
+USE_BILATERAL = True
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if USE_CLAHE else None
+
+# Tracking smoothing / stability
+MAX_HISTORY = 30
+ALPHA_POS = 0.35
+MIN_STEP_PX = 2
+
+ID_VOTE_WINDOW = 7
+ID_MIN_VOTES = 4
+GATE_DIST_PX = 25
+LOST_TIMEOUT_S = 0.35
+
+# Robot1 prediction drawing
+PATH_LEN_PX = 800
+MIN_SPEED_PX_S = 5.0
+
+# Camera control (optional)
+TRY_DISABLE_AUTO_EXPOSURE = True
+MANUAL_EXPOSURE = -6
+MANUAL_GAIN = 0
+
+# ============================================================
+# UDP TARGETS
+# ============================================================
+
+UDP_IP = "138.38.229.153"
+
+# Criti-Bot "engage" pulse output (1 byte 0x01)
+UDP_PORT_CRITICAL = 671
+TRIGGER_BYTE = b"\x01"
+PULSE_DURATION_S = 0.25
+REARM_TIMEOUT_S = 5.0
+CRITICAL_SEND_RATE_HZ = 30.0
+
+# Robo-Ball steering output (float32 radians)
+UDP_PORT_ANGLE = 672
+SEND_RATE_HZ_ANGLE = 50.0
+FLIP_ANGLE_SIGN = False
+HEADING_OFFSET_RAD = 0.0
+
+# Angle "lock-on" latch
+ANGLE_ZERO_THRESH_RAD = 0.3
+ANGLE_ZERO_FRAMES = 1
+
+# Impact pulse output (uint8=1 pulse)
+UDP_PORT_CRASH = 673
+CRASH_RADIUS_PX = 120
+HYST_PX = 8
+MIN_PULSE_PERIOD_S = 0.25
+
+# Big impact indicator
+CRASH_FLASH_S = 1.2
+CRASH_FLASH_HZ = 6.0
+
+# ============================================================
+# CHASER SPEED (px/s)
+# ============================================================
+SPHERE_SPEED_M_S = 1.66
+PX_PER_M = 20.0
+CHASER_SPEED_PX_S = SPHERE_SPEED_M_S * PX_PER_M
+MAX_INTERCEPT_T = 20.0
+
+# IP stability (arm-then-stream)
+IP_STABLE_PX = 6.0
+IP_STABLE_FRAMES = 10
+IP_LOST_RESET_S = 0.30
+
+# UI refresh & labels
+UI_POLL_MS = 15
+ANGLE_SENT_SHOW_S = 2.0
+
+# Snapshots
+SNAP_DIR = "snapshots"
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def preprocess_gray(frame_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    if USE_CLAHE and clahe is not None:
+        gray = clahe.apply(gray)
+    if USE_BILATERAL:
+        gray = cv2.bilateralFilter(gray, 5, 50, 50)
+    return gray
+
+def centroid_from_corners(corners_4x2: np.ndarray) -> np.ndarray:
+    return np.mean(corners_4x2, axis=0)
+
+def dist2(a, b):
+    dx = float(a[0] - b[0])
+    dy = float(a[1] - b[1])
+    return dx * dx + dy * dy
+
+def majority_vote(id_deque):
+    if not id_deque:
+        return None, 0
+    c = Counter(id_deque)
+    winner, votes = c.most_common(1)[0]
+    return int(winner), int(votes)
+
+def estimate_velocity(history_deque):
+    if len(history_deque) < 6:
+        return None
+    t = np.array([h[0] for h in history_deque], dtype=np.float64)
+    p = np.array([h[1] for h in history_deque], dtype=np.float64)
+    t0 = t[0]
+    tt = t - t0
+    A = np.vstack([tt, np.ones_like(tt)]).T
+    vx, _ = np.linalg.lstsq(A, p[:, 0], rcond=None)[0]
+    vy, _ = np.linalg.lstsq(A, p[:, 1], rcond=None)[0]
+    return np.array([float(vx), float(vy)], dtype=np.float64)
+
+def wrap_to_pi(a: float) -> float:
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+def angle_from_vec(vx: float, vy: float) -> float:
+    return math.atan2(vy, vx)
+
+def draw_x(img, pt, size=12, color=(255, 0, 255), thickness=3):
+    x, y = pt
+    cv2.line(img, (x - size, y - size), (x + size, y + size), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x - size, y + size), (x + size, y - size), color, thickness, cv2.LINE_AA)
+
+def draw_banner(out_img, text, top_left=(20, 20), pad=10,
+                bg_color=(0, 0, 0), text_color=(255, 255, 255), scale=0.9):
+    x, y = top_left
+    (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+    w = tw + 2 * pad
+    h = th + baseline + 2 * pad
+    cv2.rectangle(out_img, (x, y), (x + w, y + h), bg_color, -1)
+    cv2.putText(out_img, text, (x + pad, y + pad + th),
+                cv2.FONT_HERSHEY_SIMPLEX, scale, text_color, 2, cv2.LINE_AA)
+
+def compute_intercept_point(p1, v1, p2, chaser_speed, t_max=5.0):
+    r = (p1 - p2).astype(np.float64)
+    v = v1.astype(np.float64)
+    s = float(chaser_speed)
+
+    a = float(np.dot(v, v) - s * s)
+    b = float(2.0 * np.dot(r, v))
+    c = float(np.dot(r, r))
+
+    if abs(a) < 1e-9:
+        if abs(b) < 1e-9:
+            return None, None
+        t = -c / b
+        if t > 0.0:
+            t = min(t, t_max)
+            return (p1 + v1 * t).astype(np.float64), float(t)
+        return None, None
+
+    disc = b * b - 4.0 * a * c
+    if disc < 0.0:
+        return None, None
+
+    sqrt_disc = math.sqrt(disc)
+    t1 = (-b - sqrt_disc) / (2.0 * a)
+    t2 = (-b + sqrt_disc) / (2.0 * a)
+
+    candidates = [t for t in (t1, t2) if t > 0.0]
+    if not candidates:
+        return None, None
+
+    t = min(candidates)
+    if t > t_max:
+        return None, None
+
+    ip = (p1 + v1 * t).astype(np.float64)
+    return ip, float(t)
+
+
+@dataclass
+class UiStatus:
+    error: str | None
+    engaged: bool
+    unlocked: bool
+    pulse_active: bool
+    lock_on: bool
+    angle_zero_latched: bool
+    last_angle: float | None
+    impact_flash: bool
+    fps: float
+    rejected_n: int
+
+
+# ============================================================
+# WORKER: VISION + UDP RUNNER
+# ============================================================
+
+class VisionRunner:
+    def __init__(self, q: queue.Queue):
+        self.q = q
+        self.stop_evt = threading.Event()
+
+        # UI control states
+        self.engaged = False      # replaces “press s” -> ENGAGE
+        self.paused = False       # pause/resume processing (camera still read)
+
+        # UDP sockets
+        self.sock_critical = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock_angle = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock_impact = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        self.critical_send_interval = 1.0 / max(1.0, CRITICAL_SEND_RATE_HZ)
+        self.angle_send_min_dt = 1.0 / max(1.0, SEND_RATE_HZ_ANGLE)
+
+        # Camera init
+        self.cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Camera not opened. CAM_INDEX={CAM_INDEX} (try 0 then 1)")
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+
+        if TRY_DISABLE_AUTO_EXPOSURE:
+            try:
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                self.cap.set(cv2.CAP_PROP_EXPOSURE, float(MANUAL_EXPOSURE))
+                self.cap.set(cv2.CAP_PROP_GAIN, float(MANUAL_GAIN))
+            except Exception:
+                pass
+
+        self.last_rgb_frame = None  # for snapshot
+        self.full_reset()
+
+    # --- UI controls ---
+    def set_engaged(self, v: bool):
+        self.engaged = bool(v)
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+
+    def request_stop(self):
+        self.stop_evt.set()
+
+    def clear_tracking_only(self):
+        self.hist_target.clear()
+        self.hist_ball.clear()
+        self.trail_target.clear()
+        self.pos_target_filt = None
+        self.pos_ball_filt = None
+        self.last_trail_pt = None
+
+        self.id_votes_target.clear()
+        self.id_votes_ball.clear()
+        self.last_seen_target_t = None
+        self.last_seen_ball_t = None
+
+        self.ip_last = None
+        self.ip_stable_count = 0
+        self.ip_last_seen_t = None
+        self.lock_on = False
+
+        self.last_sent_angle = None
+        self.last_sent_time = None
+        self.last_udp_sent_time = None
+
+        self.angle_zero_count = 0
+        self.angle_zero_latched = False
+
+        self.last_impact_pulse_t = 0.0
+        self.impact_latched = False
+        self.last_impact_event_t = None
+
+    def full_reset(self):
+        # Engagement gate
+        self.engaged = False
+        self.paused = False
+
+        # Criti-bot engage pulse gating
+        self.armed = True
+        self.pulse_active = False
+        self.pulse_start_time = None
+        self.last_seen_critical_t = None
+        self.last_critical_send_t = 0.0
+        self.unlocked = False
+
+        # Tracking
+        self.hist_target = deque(maxlen=MAX_HISTORY)  # Criti-bot
+        self.hist_ball = deque(maxlen=MAX_HISTORY)    # Robo-ball
+
+        self.trail_target = deque(maxlen=400)
+        self.pos_target_filt = None
+        self.pos_ball_filt = None
+        self.last_trail_pt = None
+
+        self.id_votes_target = deque(maxlen=ID_VOTE_WINDOW)
+        self.id_votes_ball = deque(maxlen=ID_VOTE_WINDOW)
+
+        self.last_seen_target_t = None
+        self.last_seen_ball_t = None
+
+        # Intercept / lock-on
+        self.ip_last = None
+        self.ip_stable_count = 0
+        self.ip_last_seen_t = None
+        self.lock_on = False
+
+        # Angle streaming
+        self.last_sent_angle = None
+        self.last_sent_time = None
+        self.last_udp_sent_time = None
+
+        self.angle_zero_count = 0
+        self.angle_zero_latched = False
+
+        # Impact
+        self.last_impact_pulse_t = 0.0
+        self.impact_latched = False
+        self.last_impact_event_t = None
+
+    def send_impact_pulse(self, now_s: float):
+        payload = struct.pack("B", 1)
+        self.sock_impact.sendto(payload, (UDP_IP, UDP_PORT_CRASH))
+        self.last_impact_pulse_t = now_s
+        self.last_impact_event_t = now_s
+
+    def shutdown(self):
+        try:
+            self.cap.release()
+        except Exception:
+            pass
+        for s in (self.sock_critical, self.sock_angle, self.sock_impact):
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    # --- UI queue output ---
+    def _push_status(self, status: UiStatus):
+        try:
+            self.q.put_nowait(("status", status))
+        except queue.Full:
+            pass
+
+    def _push_frame(self, rgb: np.ndarray):
+        self.last_rgb_frame = rgb
+        try:
+            self.q.put_nowait(("frame", rgb))
+        except queue.Full:
+            pass
+
+    def snapshot(self):
+        if self.last_rgb_frame is None:
+            return None
+        os.makedirs(SNAP_DIR, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(SNAP_DIR, f"roboball_vs_critibot_{ts}.png")
+        bgr = cv2.cvtColor(self.last_rgb_frame, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(path, bgr)
+        return path
+
+    # --- main loop ---
+    def run(self):
+        while not self.stop_evt.is_set():
+            loop_start = time.perf_counter()
+
+            ret, frame = self.cap.read()
+            if not ret or frame is None:
+                self._push_status(UiStatus(
+                    error="Camera read failed",
+                    engaged=self.engaged,
+                    unlocked=self.unlocked,
+                    pulse_active=self.pulse_active,
+                    lock_on=self.lock_on,
+                    angle_zero_latched=self.angle_zero_latched,
+                    last_angle=self.last_sent_angle,
+                    impact_flash=False,
+                    fps=0.0,
+                    rejected_n=0
+                ))
+                time.sleep(0.05)
+                continue
+
+            now = time.perf_counter()
+            now_s = time.time()
+
+            # If paused: show paused banner only (no detection/UDP)
+            out = frame.copy()
+            if self.paused:
+                draw_banner(out, "PAUSED", top_left=(20, 20), bg_color=(40, 40, 40))
+                rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+                fps = 1.0 / (time.perf_counter() - loop_start + 1e-9)
+                self._push_frame(rgb)
+                self._push_status(UiStatus(
+                    error=None,
+                    engaged=self.engaged,
+                    unlocked=self.unlocked,
+                    pulse_active=self.pulse_active,
+                    lock_on=self.lock_on,
+                    angle_zero_latched=self.angle_zero_latched,
+                    last_angle=self.last_sent_angle,
+                    impact_flash=(self.last_impact_event_t is not None) and ((time.time() - self.last_impact_event_t) <= CRASH_FLASH_S),
+                    fps=float(fps),
+                    rejected_n=0
+                ))
+                continue
+
+            gray = preprocess_gray(frame)
+            corners, ids, rejected = aruco.detectMarkers(gray, ARUCO_DICT, parameters=ARUCO_PARAMS)
+
+            ids_flat = None
+            if ids is not None and len(ids) > 0:
+                ids_flat = ids.flatten().astype(int)
+                aruco.drawDetectedMarkers(out, corners, ids)
+
+            # ---------- Engagement gate ----------
+            if not self.engaged:
+                draw_banner(out, "READY: Press ENGAGE", top_left=(20, 20), bg_color=(0, 70, 120))
+                rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+                fps = 1.0 / (time.perf_counter() - loop_start + 1e-9)
+                self._push_frame(rgb)
+                self._push_status(UiStatus(
+                    error=None,
+                    engaged=False,
+                    unlocked=self.unlocked,
+                    pulse_active=self.pulse_active,
+                    lock_on=self.lock_on,
+                    angle_zero_latched=self.angle_zero_latched,
+                    last_angle=self.last_sent_angle,
+                    impact_flash=False,
+                    fps=float(fps),
+                    rejected_n=0 if rejected is None else len(rejected)
+                ))
+                continue
+
+            # ---------- Critical watch (Criti-Bot engage) ----------
+            critical_seen = False
+            if ids_flat is not None:
+                critical_seen = (CRITIBOT_ID in ids_flat)
+
+            if critical_seen:
+                self.last_seen_critical_t = now
+                if self.armed and not self.pulse_active:
+                    self.pulse_active = True
+                    self.pulse_start_time = now
+                    self.last_critical_send_t = 0.0
+                    self.armed = False
+                    self.unlocked = True
+
+            if self.pulse_active:
+                if (now - self.pulse_start_time) <= PULSE_DURATION_S:
+                    if (now - self.last_critical_send_t) >= self.critical_send_interval:
+                        self.sock_critical.sendto(TRIGGER_BYTE, (UDP_IP, UDP_PORT_CRITICAL))
+                        self.last_critical_send_t = now
+                else:
+                    self.pulse_active = False
+
+            if (not critical_seen) and (not self.armed):
+                if self.last_seen_critical_t is not None and (now - self.last_seen_critical_t) >= REARM_TIMEOUT_S:
+                    self.armed = True
+
+            # If not unlocked: no tracking/impact/angle
+            if not self.unlocked:
+                draw_banner(out, "WAITING FOR CRITI-BOT SIGNAL", top_left=(20, 20), bg_color=(120, 50, 0))
+                rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+                fps = 1.0 / (time.perf_counter() - loop_start + 1e-9)
+                self._push_frame(rgb)
+                self._push_status(UiStatus(
+                    error=None,
+                    engaged=True,
+                    unlocked=False,
+                    pulse_active=self.pulse_active,
+                    lock_on=False,
+                    angle_zero_latched=self.angle_zero_latched,
+                    last_angle=self.last_sent_angle,
+                    impact_flash=False,
+                    fps=float(fps),
+                    rejected_n=0 if rejected is None else len(rejected)
+                ))
+                continue
+
+            # ---------- Unlocked: tracking ----------
+            seen_target = False
+            seen_ball = False
+            p_target = None
+            p_ball = None
+            ball_corners = None
+
+            detections = []
+            if ids_flat is not None:
+                for i, mid in enumerate(ids_flat):
+                    c = corners[i][0]
+                    pt = centroid_from_corners(c)
+                    detections.append((int(mid), pt, i))
+
+                for mid, pt, i in detections:
+                    if mid == TARGET_ID:
+                        self.id_votes_target.append(mid)
+                    if mid == ROBOBALL_ID:
+                        self.id_votes_ball.append(mid)
+
+                t_id, t_votes = majority_vote(self.id_votes_target)
+                b_id, b_votes = majority_vote(self.id_votes_ball)
+
+                t_allowed = (t_id == TARGET_ID and t_votes >= ID_MIN_VOTES)
+                b_allowed = (b_id == ROBOBALL_ID and b_votes >= ID_MIN_VOTES)
+
+                def pick(expected_id, last_pos, allowed):
+                    if not detections:
+                        return None
+                    candidates = [(mid, pt, i) for (mid, pt, i) in detections if mid == expected_id]
+                    if allowed and candidates:
+                        if last_pos is None:
+                            return candidates[0]
+                        candidates.sort(key=lambda x: dist2(x[1], last_pos))
+                        return candidates[0]
+
+                    if last_pos is not None:
+                        close = [(mid, pt, i) for (mid, pt, i) in detections
+                                 if dist2(pt, last_pos) <= GATE_DIST_PX * GATE_DIST_PX]
+                        if close:
+                            close.sort(key=lambda x: dist2(x[1], last_pos))
+                            return close[0]
+                    return None
+
+                pick_t = pick(TARGET_ID, self.pos_target_filt, t_allowed)
+                pick_b = pick(ROBOBALL_ID, self.pos_ball_filt, b_allowed)
+
+                if pick_t is not None:
+                    _, pt, _ = pick_t
+                    seen_target = True
+                    self.last_seen_target_t = now
+                    self.pos_target_filt = pt.copy() if self.pos_target_filt is None else (1.0 - ALPHA_POS) * self.pos_target_filt + ALPHA_POS * pt
+                    p_target = self.pos_target_filt
+                    self.hist_target.append((now, p_target.copy()))
+
+                    p_int = (int(p_target[0]), int(p_target[1]))
+                    if self.last_trail_pt is None:
+                        self.trail_target.append(p_int)
+                        self.last_trail_pt = p_int
+                    else:
+                        ddx = p_int[0] - self.last_trail_pt[0]
+                        ddy = p_int[1] - self.last_trail_pt[1]
+                        if ddx * ddx + ddy * ddy >= MIN_STEP_PX * MIN_STEP_PX:
+                            self.trail_target.append(p_int)
+                            self.last_trail_pt = p_int
+
+                    cv2.circle(out, p_int, 6, (0, 255, 0), -1)
+
+                if pick_b is not None:
+                    _, pt, idx = pick_b
+                    seen_ball = True
+                    self.last_seen_ball_t = now
+                    ball_corners = corners[idx][0]
+                    self.pos_ball_filt = pt.copy() if self.pos_ball_filt is None else (1.0 - ALPHA_POS) * self.pos_ball_filt + ALPHA_POS * pt
+                    p_ball = self.pos_ball_filt
+                    self.hist_ball.append((now, p_ball.copy()))
+                    cv2.circle(out, (int(p_ball[0]), int(p_ball[1])), 6, (255, 255, 0), -1)
+
+            # Lost bridging
+            if (not seen_target) and (self.last_seen_target_t is not None) and ((now - self.last_seen_target_t) <= LOST_TIMEOUT_S):
+                p_target = self.pos_target_filt
+                seen_target = p_target is not None
+            if (not seen_ball) and (self.last_seen_ball_t is not None) and ((now - self.last_seen_ball_t) <= LOST_TIMEOUT_S):
+                p_ball = self.pos_ball_filt
+                seen_ball = p_ball is not None
+
+            # Trail
+            if len(self.trail_target) >= 2:
+                pts = np.array(self.trail_target, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(out, [pts], False, (0, 255, 255), 2)
+
+            # ---------- Impact detection ----------
+            if (p_target is not None) and (p_ball is not None):
+                dx = float(p_ball[0] - p_target[0])
+                dy = float(p_ball[1] - p_target[1])
+                d = math.hypot(dx, dy)
+
+                cv2.circle(out, (int(p_target[0]), int(p_target[1])), int(CRASH_RADIUS_PX), (0, 200, 200), 2)
+
+                if (not self.impact_latched) and (d <= CRASH_RADIUS_PX):
+                    if (now_s - self.last_impact_pulse_t) >= MIN_PULSE_PERIOD_S:
+                        self.send_impact_pulse(now_s)
+                    self.impact_latched = True
+                elif self.impact_latched and (d >= (CRASH_RADIUS_PX + HYST_PX)):
+                    self.impact_latched = False
+
+            impact_flash_active = (self.last_impact_event_t is not None) and ((now_s - self.last_impact_event_t) <= CRASH_FLASH_S)
+            if impact_flash_active:
+                phase = math.sin(2.0 * math.pi * CRASH_FLASH_HZ * (now_s - self.last_impact_event_t))
+                if phase > 0.0:
+                    overlay = out.copy()
+                    cv2.rectangle(overlay, (0, 0), (FRAME_W, FRAME_H), (0, 0, 255), -1)
+                    out = cv2.addWeighted(overlay, 0.35, out, 0.65, 0)
+                    draw_banner(out, "IMPACT CONFIRMED", top_left=(20, 20), bg_color=(0, 0, 180), scale=1.0)
+
+            # ---------- Intercept + angle stream ----------
+            if self.ip_last_seen_t is not None and (now - self.ip_last_seen_t) > IP_LOST_RESET_S:
+                self.ip_stable_count = 0
+                self.ip_last = None
+                self.ip_last_seen_t = None
+                self.lock_on = False
+                self.angle_zero_count = 0
+                self.angle_zero_latched = False
+
+            v_target = estimate_velocity(self.hist_target)
+
+            if seen_target and (p_target is not None) and (v_target is not None):
+                speed = float(np.linalg.norm(v_target))
+                if speed >= MIN_SPEED_PX_S:
+                    A = p_target.astype(np.float64)
+                    u = (v_target / (speed + 1e-12)).astype(np.float64)
+                    B = (A + u * float(PATH_LEN_PX)).astype(np.float64)
+                    cv2.line(out, (int(A[0]), int(A[1])), (int(B[0]), int(B[1])), (255, 0, 255), 3, cv2.LINE_AA)
+
+                    if seen_ball and (p_ball is not None):
+                        P = p_ball.astype(np.float64)
+                        IP, t_hit = compute_intercept_point(A, v_target, P, CHASER_SPEED_PX_S, t_max=MAX_INTERCEPT_T)
+                        if IP is not None:
+                            IP_int = (int(IP[0]), int(IP[1]))
+                            cv2.line(out, (int(P[0]), int(P[1])), IP_int, (255, 0, 255), 2, cv2.LINE_AA)
+                            draw_x(out, IP_int, size=14, color=(255, 0, 255), thickness=3)
+
+                            self.ip_last_seen_t = now
+                            if self.ip_last is None:
+                                self.ip_last = IP.copy()
+                                self.ip_stable_count = 0
+                            else:
+                                step = float(np.linalg.norm(IP - self.ip_last))
+                                self.ip_stable_count = (self.ip_stable_count + 1) if (step <= IP_STABLE_PX) else 0
+                                self.ip_last = IP.copy()
+
+                            ip_stable = (self.ip_stable_count >= IP_STABLE_FRAMES)
+                            if (not self.lock_on) and ip_stable:
+                                self.lock_on = True
+
+                            # Send steering angle if locked-on and we have RoboBall corners
+                            if self.lock_on and (ball_corners is not None):
+                                can_send = True
+                                if self.last_udp_sent_time is not None:
+                                    can_send = (now - self.last_udp_sent_time) >= self.angle_send_min_dt
+
+                                if can_send:
+                                    c0 = ball_corners[0]
+                                    c1 = ball_corners[1]
+                                    hx = float(c1[0] - c0[0])
+                                    hy = float(c1[1] - c0[1])
+
+                                    heading = wrap_to_pi(angle_from_vec(hx, hy) + HEADING_OFFSET_RAD)
+
+                                    ddx = float(IP[0] - P[0])
+                                    ddy = float(IP[1] - P[1])
+                                    desired = angle_from_vec(ddx, ddy)
+
+                                    ang_err = wrap_to_pi(desired - heading)
+                                    if FLIP_ANGLE_SIGN:
+                                        ang_err = -ang_err
+
+                                    # Zero latch = "lock-on complete"
+                                    if self.angle_zero_latched:
+                                        ang_to_send = 0.0
+                                    else:
+                                        if abs(ang_err) <= ANGLE_ZERO_THRESH_RAD:
+                                            self.angle_zero_count += 1
+                                            if self.angle_zero_count >= ANGLE_ZERO_FRAMES:
+                                                self.angle_zero_latched = True
+                                            ang_to_send = 0.0
+                                        else:
+                                            self.angle_zero_count = 0
+                                            ang_to_send = float(ang_err)
+
+                                    self.sock_angle.sendto(struct.pack("<f", float(ang_to_send)), (UDP_IP, UDP_PORT_ANGLE))
+                                    self.last_udp_sent_time = now
+                                    self.last_sent_angle = float(ang_to_send)
+                                    self.last_sent_time = now
+
+            # Minimal on-frame overlay (keep the feed clean)
+            if self.pulse_active:
+                draw_banner(out, "ENGAGE PULSE", top_left=(20, 20), bg_color=(0, 120, 0))
+            elif self.unlocked:
+                if impact_flash_active:
+                    pass
+                elif self.lock_on:
+                    draw_banner(out, "LOCK-ON", top_left=(20, 20), bg_color=(90, 0, 120))
+                else:
+                    draw_banner(out, "TRACKING", top_left=(20, 20), bg_color=(30, 30, 30))
+
+            fps = 1.0 / (time.perf_counter() - loop_start + 1e-9)
+            rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+            self._push_frame(rgb)
+
+            self._push_status(UiStatus(
+                error=None,
+                engaged=self.engaged,
+                unlocked=self.unlocked,
+                pulse_active=self.pulse_active,
+                lock_on=self.lock_on,
+                angle_zero_latched=self.angle_zero_latched,
+                last_angle=self.last_sent_angle,
+                impact_flash=impact_flash_active,
+                fps=float(fps),
+                rejected_n=0 if rejected is None else len(rejected)
+            ))
+
+        self.shutdown()
+
+
+# ============================================================
+# UI
+# ============================================================
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+
+        self.title("Robo-Ball vs Criti-Bot — Attack Console")
+        self.geometry("1400x860")
+        self.minsize(1200, 760)
+        self.protocol("WM_DELETE_WINDOW", self.on_quit)
+
+        self.q = queue.Queue(maxsize=10)
+
+        self.runner = VisionRunner(self.q)
+        self.worker = threading.Thread(target=self.runner.run, daemon=True)
+        self.worker.start()
+
+        # Layout
+        self.grid_columnconfigure(0, weight=4)
+        self.grid_columnconfigure(1, weight=2)
+        self.grid_rowconfigure(0, weight=1)
+
+        # --- Video area (left) ---
+        self.video_frame = ctk.CTkFrame(self, corner_radius=14)
+        self.video_frame.grid(row=0, column=0, padx=(12, 6), pady=12, sticky="nsew")
+        self.video_frame.grid_rowconfigure(0, weight=1)
+        self.video_frame.grid_columnconfigure(0, weight=1)
+
+        self.video_label = ctk.CTkLabel(self.video_frame, text="")
+        self.video_label.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+        self.video_label.configure(width=1020, height=720)
+        self.video_label.grid_propagate(False)
+
+        self._ctk_img = None
+        self._last_frame_rgb = None
+
+        # --- Control area (right) ---
+        self.panel = ctk.CTkFrame(self, corner_radius=14)
+        self.panel.grid(row=0, column=1, padx=(6, 12), pady=12, sticky="nsew")
+        self.panel.grid_columnconfigure(0, weight=1)
+        self.panel.grid_rowconfigure(6, weight=1)
+
+        self.state_badge = ctk.CTkLabel(self.panel, text="SAFE", font=ctk.CTkFont(size=28, weight="bold"))
+        self.state_badge.grid(row=0, column=0, padx=14, pady=(14, 10), sticky="ew")
+
+        # Primary controls
+        self.btn_engage = ctk.CTkButton(self.panel, text="ENGAGE (Start)", height=44, command=self.on_engage)
+        self.btn_engage.grid(row=1, column=0, padx=14, pady=(0, 10), sticky="ew")
+
+        self.btn_pause = ctk.CTkButton(self.panel, text="PAUSE VISION", height=40, command=self.on_pause)
+        self.btn_pause.grid(row=2, column=0, padx=14, pady=8, sticky="ew")
+
+        self.btn_clear = ctk.CTkButton(self.panel, text="CLEAR TRACK", height=40, command=self.on_clear)
+        self.btn_clear.grid(row=3, column=0, padx=14, pady=8, sticky="ew")
+
+        self.btn_reset = ctk.CTkButton(self.panel, text="FULL RESET", height=40, command=self.on_reset)
+        self.btn_reset.grid(row=4, column=0, padx=14, pady=8, sticky="ew")
+
+        # Secondary controls
+        row2 = ctk.CTkFrame(self.panel, fg_color="transparent")
+        row2.grid(row=5, column=0, padx=14, pady=(12, 8), sticky="ew")
+        row2.grid_columnconfigure(0, weight=1)
+        row2.grid_columnconfigure(1, weight=1)
+
+        self.btn_snap = ctk.CTkButton(row2, text="SNAPSHOT", command=self.on_snapshot)
+        self.btn_snap.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
+        self.btn_quit = ctk.CTkButton(row2, text="QUIT", fg_color="#8b0000", command=self.on_quit)
+        self.btn_quit.grid(row=0, column=1, padx=(6, 0), sticky="ew")
+
+        # Telemetry (compact)
+        self.telemetry = ctk.CTkTextbox(self.panel, height=180, wrap="word", font=ctk.CTkFont(size=14))
+        self.telemetry.grid(row=6, column=0, padx=14, pady=(10, 14), sticky="nsew")
+        self.telemetry.configure(state="disabled")
+        # Hotkeys
+        self.bind("<Return>", lambda e: self.on_engage())
+        self.bind("<space>", lambda e: self.on_pause())
+        self.bind("<c>", lambda e: self.on_clear())
+        self.bind("<r>", lambda e: self.on_reset())
+        self.bind("<q>", lambda e: self.on_quit())
+        self.bind("<s>", lambda e: self.on_snapshot())
+
+        self.after(UI_POLL_MS, self.poll_queue)
+
+    # --- UI actions ---
+    def on_engage(self):
+        self.runner.set_engaged(True)
+
+    def on_pause(self):
+        self.runner.toggle_pause()
+        self.btn_pause.configure(text="RESUME VISION" if self.runner.paused else "PAUSE VISION")
+
+    def on_clear(self):
+        self.runner.clear_tracking_only()
+
+    def on_reset(self):
+        self.runner.full_reset()
+        self.btn_pause.configure(text="PAUSE VISION")
+
+    def on_snapshot(self):
+        path = self.runner.snapshot()
+        if path is None:
+            self._write_telemetry_line("Snapshot: no frame available yet.")
+        else:
+            self._write_telemetry_line(f"Snapshot saved: {path}")
+
+    def on_quit(self):
+        try:
+            self.runner.request_stop()
+        except Exception:
+            pass
+        self.after(120, self.destroy)
+
+    # --- UI loop ---
+    def poll_queue(self):
+        latest_frame = None
+        latest_status = None
+
+        try:
+            while True:
+                kind, payload = self.q.get_nowait()
+                if kind == "frame":
+                    latest_frame = payload
+                elif kind == "status":
+                    latest_status = payload
+        except queue.Empty:
+            pass
+
+        if latest_frame is not None:
+            self._last_frame_rgb = latest_frame
+            self._update_frame(latest_frame)
+
+        if latest_status is not None:
+            self._update_status(latest_status)
+
+        self.after(UI_POLL_MS, self.poll_queue)
+
+    def _update_frame(self, rgb_np: np.ndarray):
+        # Resize to fit the label width while keeping aspect ratio
+        h, w = rgb_np.shape[:2]
+        target_w = 1020
+        scale = target_w / float(w)
+        target_h = int(h * scale)
+
+        pil = Image.fromarray(rgb_np).resize((target_w, target_h))
+        self._ctk_img = ctk.CTkImage(light_image=pil, dark_image=pil, size=(target_w, target_h))
+        self.video_label.configure(image=self._ctk_img, text="")
+
+    def _update_status(self, s: UiStatus):
+        # Decide state badge
+        if s.error:
+            badge = "ERROR"
+        elif s.impact_flash:
+            badge = "IMPACT"
+        elif not s.engaged:
+            badge = "SAFE"
+        elif s.pulse_active:
+            badge = "ENGAGING"
+        elif s.unlocked and s.lock_on:
+            badge = "LOCKED"
+        elif s.unlocked:
+            badge = "HUNTING"
+        else:
+            badge = "ARMED"
+
+        self.state_badge.configure(text=badge)
+
+        ang_txt = "—" if s.last_angle is None else f"{s.last_angle:+.3f} rad"
+        lock_txt = "Yes" if s.lock_on else "No"
+        zero_txt = "Yes" if s.angle_zero_latched else "No"
+        unlock_txt = "Yes" if s.unlocked else "No"
+        engage_txt = "Yes" if s.engaged else "No"
+
+        text = (
+            f"Mission: Robo-Ball attacks Criti-Bot\n"
+            f"\n"
+            f"Engaged: {engage_txt}\n"
+            f"Unlocked (Criti-Bot seen): {unlock_txt}\n"
+            f"Lock-On Ready: {lock_txt}\n"
+            f"Lock-On Complete (Angle=0 latch): {zero_txt}\n"
+            f"Steering Angle Sent: {ang_txt}\n"
+            f"\n"
+            f"FPS: {s.fps:.1f}\n"
+            f"Rejected markers: {s.rejected_n}\n"
+        )
+        if s.error:
+            text += f"\nError: {s.error}\n"
+
+        self.telemetry.configure(state="normal")
+        self.telemetry.delete("1.0", "end")
+        self.telemetry.insert("end", text)
+        self.telemetry.configure(state="disabled")
+
+    def _write_telemetry_line(self, line: str):
+        # lightweight message injection (non-persistent; shown next refresh)
+        # If you want persistent logs, we can add a separate scrolling log box.
+        pass
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
